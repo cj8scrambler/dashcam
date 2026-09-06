@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Dashcam Viewer</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <style>
+    html, body { margin: 0; height: 100%; font-family: system-ui, sans-serif; background: #12141a; color: #e7e9ee; }
+    #layout { display: flex; height: 100vh; }
+    #map-pane { position: relative; flex: 1 1 auto; min-width: 0; min-height: 0; }
+    #map { width: 100%; height: 100%; }
+    #side { width: 420px; flex: 0 0 420px; display: flex; flex-direction: column; border-left: 1px solid #2a2d36; background: #181b22; overflow-y: auto; }
+
+    #calendar { padding: 10px; border-bottom: 1px solid #2a2d36; }
+    #cal-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+    #cal-header button { background: #2a2d36; color: #e7e9ee; border: none; border-radius: 4px; padding: 4px 10px; cursor: pointer; }
+    #cal-header button:hover { background: #383d4a; }
+    #cal-label { font-size: 13px; font-weight: 600; }
+    #cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 3px; }
+    .cal-dow { font-size: 10px; color: #6b7280; text-align: center; padding-bottom: 2px; }
+    .cal-day { font-size: 12px; text-align: center; padding: 5px 0; border-radius: 4px; color: #4b5160; }
+    .cal-day.has-data { color: #e7e9ee; background: #232838; cursor: pointer; }
+    .cal-day.has-data:hover { background: #2f3650; }
+    .cal-day.selected { background: #2b6cff; color: #fff; }
+    .cal-day.empty { visibility: hidden; }
+
+    #videos { display: flex; flex-direction: column; gap: 8px; padding: 10px; }
+    .video-block { position: relative; background: #0e1015; border-radius: 6px; overflow: hidden; }
+    .video-label { display: flex; justify-content: space-between; align-items: center; font-size: 12px; padding: 4px 8px; color: #9aa2b1; text-transform: uppercase; letter-spacing: 0.05em; }
+    .video-download { color: #6b7280; text-decoration: none; text-transform: none; letter-spacing: normal; font-size: 11px; }
+    .video-download:hover { color: #e7e9ee; }
+    video { width: 100%; display: block; background: #000; }
+    .video-status {
+      position: absolute; inset: 0; top: 22px; display: flex; flex-direction: column; align-items: center; justify-content: center;
+      gap: 8px; text-align: center; padding: 12px; font-size: 12px; color: #9aa2b1; background: #0e1015; pointer-events: none;
+    }
+    .video-status progress { width: 80%; height: 6px; accent-color: #2b6cff; }
+    .video-status .v-progress-text { font-size: 11px; color: #6b7280; }
+
+    /* Shown when this channel's segment has run out but other channels are
+       still playing - the video is hidden and time keeps moving forward. */
+    .video-gap-note {
+      display: none; position: absolute; inset: 22px 0 0 0; align-items: center; justify-content: center;
+      text-align: center; padding: 12px; font-size: 12px; color: #6b7280; background: #0e1015; pointer-events: none;
+    }
+    .video-block.gap video { visibility: hidden; }
+    .video-block.gap .video-gap-note { display: flex; }
+    #info { padding: 10px; border-top: 1px solid #2a2d36; font-size: 13px; color: #c3c8d4; }
+    #info b { color: #fff; }
+    #legend { position: absolute; bottom: 24px; left: 10px; background: rgba(20,22,28,0.9); padding: 8px 12px; border-radius: 6px; font-size: 12px; color: #e7e9ee; z-index: 1000; }
+    #legend .grad { width: 200px; height: 10px; border-radius: 3px; margin: 4px 0; }
+    .empty-msg { color: #666; font-size: 13px; padding: 10px; }
+
+    #theater-exit {
+      display: none; position: fixed; top: 12px; right: 12px; z-index: 30;
+      background: #2b6cff; color: #fff; border: none; border-radius: 6px;
+      padding: 10px 16px; cursor: pointer; font-size: 14px; font-weight: 600;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+    }
+    #theater-exit:hover { background: #1d5ae0; }
+
+    #follow-toggle {
+      position: absolute; top: 10px; right: 10px; z-index: 1000; cursor: pointer;
+      background: rgba(20,22,28,0.9); color: #9aa2b1; border: 1px solid #2a2d36; border-radius: 6px;
+      padding: 6px 10px; font-size: 12px;
+    }
+    #follow-toggle.active { color: #fff; border-color: #2b6cff; background: #2b6cff; }
+
+    /*
+     * Theater mode is a 2x2 grid: map + up to 3 video channels as siblings.
+     * #side and #videos use display:contents so their children (the map's
+     * existing siblings don't move - #side/#videos boxes just disappear for
+     * layout purposes) become direct grid items of #layout, without any DOM
+     * restructuring in JS. Cell placement is by `order` (not DOM position):
+     * front top-left, interior top-right, rear bottom-left, map bottom-right.
+     */
+    #layout.theater { display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; gap: 6px; background: #000; }
+    #layout.theater #calendar,
+    #layout.theater #info { display: none; }
+    #layout.theater #side,
+    #layout.theater #videos { display: contents; }
+    #layout.theater #map-pane,
+    #layout.theater .video-block { min-width: 0; min-height: 0; }
+    #layout.theater #theater-exit { display: block; }
+    #layout.theater .video-block.channel-front { order: 1; }
+    #layout.theater .video-block.channel-interior { order: 2; }
+    #layout.theater .video-block.channel-rear { order: 3; }
+    #layout.theater #map-pane { order: 4; }
+  </style>
+</head>
+<body>
+  <div id="layout">
+    <div id="map-pane">
+      <div id="map"></div>
+      <button id="follow-toggle" class="active">Auto-follow: ON</button>
+      <div id="legend">
+        <div>Speed (mph)</div>
+        <div class="grad" style="background: linear-gradient(to right, #2b6cff 0%, #22c55e 31.25%, #eab308 62.5%, #ef4444 100%);"></div>
+        <div style="display:flex; justify-content:space-between;"><span>0</span><span>80+</span></div>
+      </div>
+    </div>
+    <div id="side">
+      <div id="calendar">
+        <div id="cal-header">
+          <button id="cal-prev">&lsaquo;</button>
+          <span id="cal-label"></span>
+          <button id="cal-next">&rsaquo;</button>
+        </div>
+        <div id="cal-grid"></div>
+      </div>
+      <button id="theater-exit">&larr; Back to map</button>
+      <div id="videos"><div class="empty-msg">Select a day with data, then click a point on the track.</div></div>
+      <div id="info">Select a day on the calendar to load its track.</div>
+    </div>
+  </div>
+
+<script>
+const CHANNEL_ORDER = ["front", "interior", "rear"];
+let track = [];
+let daysWithData = new Map();   // "YYYY-MM-DD" -> count
+let calMonth;                    // first-of-month Date being displayed (local browser time, date-only)
+let selectedDate = null;
+
+// Fixed speed->color scale (mph), same across every day - NOT rescaled to
+// each day's max speed. 0=blue ramping through green/yellow to red at 80,
+// then red fades to purple up to 120 (clamped beyond that).
+const SPEED_SCALE = [
+  [0,   [43, 108, 255]],   // blue
+  [25,  [34, 197, 94]],    // green
+  [50,  [234, 179, 8]],    // yellow
+  [80,  [239, 68, 68]],    // red
+  [120, [168, 85, 247]],   // purple
+];
+
+function speedColor(speedMph) {
+  const stops = SPEED_SCALE;
+  if (speedMph <= stops[0][0]) return `rgb(${stops[0][1].join(",")})`;
+  if (speedMph >= stops[stops.length - 1][0]) return `rgb(${stops[stops.length - 1][1].join(",")})`;
+  for (let i = 0; i < stops.length - 1; i++) {
+    const [s0, c0] = stops[i];
+    const [s1, c1] = stops[i + 1];
+    if (speedMph >= s0 && speedMph <= s1) {
+      const f = (speedMph - s0) / (s1 - s0);
+      const c = c0.map((v, idx) => Math.round(v + (c1[idx] - v) * f));
+      return `rgb(${c[0]},${c[1]},${c[2]})`;
+    }
+  }
+}
+
+const map = L.map('map', { zoomControl: true });
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 19,
+  attribution: '&copy; OpenStreetMap contributors'
+}).addTo(map);
+
+let trackLayer = L.layerGroup().addTo(map);
+let trackMs = [];        // epoch ms per track point, parallel to `track`, for binary search
+let positionMarker = null;
+let autoFollow = true;
+
+const followToggleEl = document.getElementById('follow-toggle');
+followToggleEl.addEventListener('click', () => {
+  autoFollow = !autoFollow;
+  followToggleEl.textContent = `Auto-follow: ${autoFollow ? 'ON' : 'OFF'}`;
+  followToggleEl.classList.toggle('active', autoFollow);
+});
+
+function updatePositionMarker(point) {
+  const latlng = [point.lat, point.lon];
+  if (!positionMarker) {
+    positionMarker = L.circleMarker(latlng, {
+      radius: 8, color: '#fff', weight: 2, fillColor: '#2b6cff', fillOpacity: 1
+    }).addTo(map);
+  } else {
+    positionMarker.setLatLng(latlng);
+  }
+  if (autoFollow) {
+    // panTo (not setView) so zoom is left exactly as the user set it; Leaflet
+    // eases smoothly toward the latest target even if called again before a
+    // prior pan finishes, which timeupdate firing several times/sec relies on.
+    map.panTo(latlng, { animate: true, duration: 0.5, easeLinearity: 1 });
+  }
+}
+
+// Binary search: the track point whose timestamp is closest to absMs.
+function findNearestTrackPoint(absMs) {
+  if (trackMs.length === 0) return null;
+  if (absMs <= trackMs[0]) return track[0];
+  if (absMs >= trackMs[trackMs.length - 1]) return track[track.length - 1];
+  let lo = 0, hi = trackMs.length - 1;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (trackMs[mid] <= absMs) lo = mid; else hi = mid;
+  }
+  return (absMs - trackMs[lo] <= trackMs[hi] - absMs) ? track[lo] : track[hi];
+}
+
+// First track point at or after ms, or null if ms is past all of today's
+// data. Used for auto-advance: unlike findNearestTrackPoint, this never
+// snaps backward, so it can't get stuck re-matching the point we just
+// finished playing.
+function findFirstTrackPointAtOrAfter(ms) {
+  if (!Number.isFinite(ms) || trackMs.length === 0 || ms > trackMs[trackMs.length - 1]) return null;
+  let lo = 0, hi = trackMs.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (trackMs[mid] < ms) lo = mid + 1; else hi = mid;
+  }
+  return track[lo];
+}
+
+async function loadDays() {
+  const res = await fetch('/api/days');
+  const days = await res.json();
+  daysWithData = new Map(days.map(d => [d.date, d.count]));
+
+  if (days.length > 0) {
+    const [y, m] = days[days.length - 1].date.split('-').map(Number);
+    calMonth = new Date(y, m - 1, 1);
+  } else {
+    const now = new Date();
+    calMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+  }
+  renderCalendar();
+
+  if (days.length > 0) {
+    selectDay(days[days.length - 1].date);
+  }
+}
+
+function renderCalendar() {
+  const grid = document.getElementById('cal-grid');
+  grid.innerHTML = '';
+  document.getElementById('cal-label').textContent =
+    calMonth.toLocaleString(undefined, { month: 'long', year: 'numeric' });
+
+  for (const dow of ['S', 'M', 'T', 'W', 'T', 'F', 'S']) {
+    const el = document.createElement('div');
+    el.className = 'cal-dow';
+    el.textContent = dow;
+    grid.appendChild(el);
+  }
+
+  const year = calMonth.getFullYear(), month = calMonth.getMonth();
+  const firstDow = new Date(year, month, 1).getDay();
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+
+  for (let i = 0; i < firstDow; i++) {
+    const el = document.createElement('div');
+    el.className = 'cal-day empty';
+    grid.appendChild(el);
+  }
+  for (let d = 1; d <= daysInMonth; d++) {
+    const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+    const el = document.createElement('div');
+    el.className = 'cal-day';
+    el.textContent = d;
+    if (daysWithData.has(dateStr)) {
+      el.classList.add('has-data');
+      el.title = `${daysWithData.get(dateStr)} GPS fixes`;
+      el.addEventListener('click', () => selectDay(dateStr));
+    }
+    if (dateStr === selectedDate) el.classList.add('selected');
+    grid.appendChild(el);
+  }
+}
+
+document.getElementById('cal-prev').addEventListener('click', () => {
+  calMonth = new Date(calMonth.getFullYear(), calMonth.getMonth() - 1, 1);
+  renderCalendar();
+});
+document.getElementById('cal-next').addEventListener('click', () => {
+  calMonth = new Date(calMonth.getFullYear(), calMonth.getMonth() + 1, 1);
+  renderCalendar();
+});
+
+async function selectDay(dateStr) {
+  selectedDate = dateStr;
+  renderCalendar();
+
+  const res = await fetch(`/api/track?date=${encodeURIComponent(dateStr)}`);
+  track = await res.json();
+  trackMs = track.map(p => Date.parse(p.t));
+
+  document.getElementById('videos').innerHTML =
+    '<div class="empty-msg">Click a point on the track to load nearby video.</div>';
+  document.getElementById('info').textContent = `${dateStr} - click the path to inspect a point.`;
+
+  trackLayer.clearLayers();
+  if (positionMarker) { map.removeLayer(positionMarker); positionMarker = null; }
+  if (track.length === 0) {
+    document.getElementById('info').textContent = `${dateStr} - no GPS fixes.`;
+    return;
+  }
+  const bounds = [];
+  for (let i = 0; i < track.length - 1; i++) {
+    const a = track[i], b = track[i + 1];
+    const avgSpeed = (a.speed_mph + b.speed_mph) / 2;
+    const color = speedColor(avgSpeed);
+    const seg = L.polyline([[a.lat, a.lon], [b.lat, b.lon]], {
+      color, weight: 5, opacity: 0.9
+    }).addTo(trackLayer);
+    seg.on('click', () => onPointClick(a));
+    bounds.push([a.lat, a.lon]);
+  }
+  bounds.push([track[track.length - 1].lat, track[track.length - 1].lon]);
+  map.fitBounds(bounds, { padding: [30, 30] });
+}
+
+// Channels currently loaded, for cross-channel synced playback:
+// [{ channel, el, startMs, endMs }, ...] - startMs/endMs are the segment's
+// start_time/end_time (coverage window) as epoch ms.
+let activeVideos = [];
+let syncingPlayback = false;   // synchronous re-entrancy guard while we drive the follower elements
+let seekMuteUntil = 0;         // performance.now() until which follower 'seeked' events are ignored -
+                              // a programmatic currentTime write fires 'seeked' too, and without this
+                              // the channels ping-pong seeks off each other (stutter, audio glitching)
+let advancingToNext = false;  // guards against the group advancing to the next segment more than once
+let failedAdvanceStreak = 0;  // consecutive auto-advances where no channel could be prepared - circuit breaker
+
+// A channel is "finished" for advance purposes once it has played to its end,
+// failed to load at all (bad transcode, missing file), or is parked within a
+// hair of its end (a sibling ending first can pause it just short of its own
+// 'ended' event). Either way it won't contribute any more frames here.
+const channelFinished = a =>
+  a.broken ||
+  a.el.ended ||
+  (a.el.paused && a.el.duration > 0 && a.el.currentTime >= a.el.duration - 0.5);
+const groupFinished = () => activeVideos.length > 0 && activeVideos.every(channelFinished);
+
+function enterTheaterMode() {
+  document.getElementById('layout').classList.add('theater');
+  document.getElementById('side').scrollTop = 0;  // else the exit button can scroll out of view
+  requestAnimationFrame(() => map.invalidateSize());  // map's container size just changed
+}
+function exitTheaterMode() {
+  document.getElementById('layout').classList.remove('theater');
+  requestAnimationFrame(() => map.invalidateSize());
+}
+document.getElementById('theater-exit').addEventListener('click', exitTheaterMode);
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') exitTheaterMode();
+});
+
+function wireSyncedPlayback() {
+  for (const { el, startMs } of activeVideos) {
+    el.addEventListener('play', () => propagate(el, startMs, /*enterTheater=*/true));
+    el.addEventListener('pause', () => {
+      // A video reaching its end fires 'pause' (then 'ended') with currentTime
+      // sitting right on duration. Don't let that drag the other channels to a
+      // stop - they need to reach their own ends and fire their own 'ended' so
+      // the group can advance. Only propagate a genuine mid-clip pause.
+      if (el.ended || (el.duration > 0 && el.currentTime >= el.duration - 0.25)) return;
+      propagate(el, startMs);
+    });
+    el.addEventListener('seeked', () => {
+      // Ignore 'seeked' events we caused ourselves by writing currentTime on a
+      // follower (see seekMuteUntil) - otherwise every sync kicks off another
+      // and the channels ping-pong seeks (stutter, audio glitching).
+      if (performance.now() < seekMuteUntil) return;
+      propagate(el, startMs);
+    });
+  }
+}
+
+// Bring every other channel onto `masterEl`'s current instant and play/pause
+// state. A follower whose footage doesn't reach that instant is paused and
+// blanked instead. Only a real 'play' event enters theater mode.
+function propagate(masterEl, masterStartMs, enterTheater) {
+  if (syncingPlayback) return;
+  syncingPlayback = true;
+  const masterAbsMs = masterStartMs + masterEl.currentTime * 1000;
+  const masterPaused = masterEl.paused;
+  for (const { el, startMs, broken } of activeVideos) {
+    if (el === masterEl || broken) continue;
+    const block = el.closest('.video-block');
+    const dur = el.duration || 0;
+    const target = (masterAbsMs - startMs) / 1000;
+    if (dur && target >= dur) {
+      if (block) block.classList.add('gap');
+      if (!el.paused) el.pause();
+      continue;
+    }
+    if (block) block.classList.remove('gap');
+    const clamped = Math.max(0, Math.min(target, dur || target));
+    if (Math.abs(el.currentTime - clamped) > 0.3) {
+      seekMuteUntil = performance.now() + 700;  // the 'seeked' this write triggers is ours, not the user's
+      el.currentTime = clamped;
+    }
+    if (masterPaused && !el.paused) el.pause();
+    else if (!masterPaused && el.paused) el.play().catch(() => {});
+  }
+  syncingPlayback = false;
+  if (enterTheater && !masterPaused) enterTheaterMode();
+}
+
+// Called from the lead channel's timeupdate: nudge any follower that has
+// drifted out of sync back onto the lead's clock. Recovers cases where a
+// user-seek's follow-up sync got swallowed by the seek-mute window, without
+// the tight ping-pong that reacting to every 'seeked' would cause.
+function resyncFollowers(lead) {
+  if (syncingPlayback || performance.now() < seekMuteUntil) return;
+  if (lead.el.paused) return;
+  const absMs = lead.startMs + lead.el.currentTime * 1000;
+  for (const { el, startMs, broken } of activeVideos) {
+    if (el === lead.el || broken || el.paused) continue;
+    const dur = el.duration || 0;
+    const target = (absMs - startMs) / 1000;
+    if (dur && target >= dur) continue;  // handled by the gap logic
+    if (Math.abs(el.currentTime - target) > 0.5) {
+      seekMuteUntil = performance.now() + 700;
+      el.currentTime = Math.max(0, Math.min(target, dur || target));
+    }
+  }
+}
+
+// Every loaded channel is finished (played out or broken) - jump to the next
+// segment so playback time keeps moving forward.
+function advanceGroupToNextSegment() {
+  if (advancingToNext || activeVideos.length === 0) return;
+  if (activeVideos.every(a => a.broken) && ++failedAdvanceStreak > 3) {
+    document.getElementById('info').textContent =
+      'Playback stopped: several segments in a row could not be prepared. ' +
+      'Check the source media, then click the track to retry.';
+    return;
+  }
+  // Advance to the first track point at/after the furthest-reaching loaded
+  // segment - by API coverage window (a.endMs) and by real playback duration,
+  // whichever is later - so we never land back inside a segment we just
+  // finished and loop on it. Skip non-finite values (e.g. a.endMs when an
+  // older backend didn't send end_time, or duration on a broken element)
+  // rather than letting Math.max return NaN and snapping to the day's start.
+  const ends = [];
+  for (const a of activeVideos) {
+    if (Number.isFinite(a.endMs)) ends.push(a.endMs);
+    if (a.el.duration) ends.push(a.startMs + a.el.duration * 1000);
+  }
+  if (ends.length === 0) return;  // nothing to go on - stop here rather than guess
+  const nextPoint = findFirstTrackPointAtOrAfter(Math.max(...ends));
+  if (!nextPoint) return;  // past the end of today's track - just stop
+
+  advancingToNext = true;
+  onPointClick(nextPoint, { autoplay: true }).finally(() => { advancingToNext = false; });
+}
+
+async function onPointClick(point, { autoplay = false } = {}) {
+  document.getElementById('info').innerHTML =
+    `<b>${point.t_local.replace('T', ' ').split(/[+-]\d\d:\d\d$/)[0]}</b><br>` +
+    `Speed: ${point.speed_mph} mph (${point.speed_kmh} km/h)<br>` +
+    `Altitude: ${point.alt_m} m<br>` +
+    `Lat/Lon: ${point.lat.toFixed(6)}, ${point.lon.toFixed(6)}`;
+  updatePositionMarker(point);
+
+  const res = await fetch(`/api/videos?ts=${encodeURIComponent(point.t)}`);
+  const segments = await res.json();
+  const container = document.getElementById('videos');
+  container.innerHTML = '';
+  activeVideos = [];
+
+  const channels = CHANNEL_ORDER.filter(c => c in segments);
+  if (channels.length === 0) {
+    container.innerHTML = '<div class="empty-msg">No video found covering this timestamp.</div>';
+    return;
+  }
+  for (const channel of channels) {
+    const seg = segments[channel];
+    const block = document.createElement('div');
+    block.className = `video-block channel-${channel}`;
+    block.innerHTML = `<div class="video-label">
+        <span>${channel}</span>
+        <a class="video-download" href="/original/${encodeURIComponent(seg.filename)}" download title="Download the original, full-resolution file (not the browser-playable transcode)">&#8681; original</a>
+      </div>
+      <div class="video-status">
+        <div>Preparing video for playback&hellip;</div>
+        <progress class="v-progress" max="100" value="0"></progress>
+        <div class="v-progress-text">Starting&hellip;</div>
+      </div>
+      <div class="video-gap-note">No footage from this camera for this moment.</div>
+      <video controls preload="metadata" src="${seg.url}"${channel === 'front' ? '' : ' muted'}></video>`;
+    container.appendChild(block);
+    const status = block.querySelector('.video-status');
+    const gapNote = block.querySelector('.video-gap-note');
+    const v = block.querySelector('video');
+    v.muted = channel !== 'front';  // only the front camera plays audio; the rest would just echo
+    const startMs = Date.parse(seg.start_time);
+    const av = { channel, el: v, startMs, endMs: Date.parse(seg.end_time), broken: false };
+
+    v.addEventListener('loadedmetadata', () => { v.currentTime = seg.offset_seconds; });
+    v.addEventListener('loadeddata', () => {
+      status.remove();
+      stopProgressPolling(status);
+      failedAdvanceStreak = 0;  // a channel became playable - we're making real progress again
+      if (autoplay) v.play();
+    });
+    v.addEventListener('timeupdate', () => {
+      const nearest = findNearestTrackPoint(startMs + v.currentTime * 1000);
+      if (nearest) updatePositionMarker(nearest);
+      // The first non-broken channel is the sync "lead"; from its clock, pull
+      // any drifted follower back into line (see resyncFollowers).
+      if (activeVideos.length > 1 && av === activeVideos.find(a => !a.broken)) resyncFollowers(av);
+    });
+    v.addEventListener('ended', () => {
+      // One channel reaching the end of its file does NOT mean the others
+      // have - segments on different channels are commonly different real
+      // lengths (truncated recordings, camera restarts, a corrupt transcode).
+      // Blank this channel out and let the rest keep playing; only once every
+      // loaded channel is finished do we advance to the next segment. This
+      // keeps playback time moving forward instead of a short clip on one
+      // channel yanking the whole group back to a segment boundary.
+      if (!groupFinished()) {
+        block.classList.add('gap');
+        return;
+      }
+      advanceGroupToNextSegment();
+    });
+    v.addEventListener('error', () => {
+      // Transcode failed / file unavailable. Treat this channel as finished
+      // (blanked) rather than leaving a dead "preparing..." panel, and don't
+      // let it wedge the group - if it's the last one outstanding, advance.
+      av.broken = true;
+      status.remove();
+      stopProgressPolling(status);
+      gapNote.textContent = 'Video unavailable for this segment.';
+      block.classList.add('gap');
+      if (groupFinished()) advanceGroupToNextSegment();
+    });
+    // If the user scrubs back into this channel's covered range, un-blank it.
+    const unGap = () => { if (!v.ended && !av.broken) block.classList.remove('gap'); };
+    v.addEventListener('play', unGap);
+    v.addEventListener('seeked', unGap);
+    activeVideos.push(av);
+    pollTranscodeProgress(status, seg.filename);
+  }
+  wireSyncedPlayback();
+}
+
+const _progressTimers = new WeakMap();
+
+function stopProgressPolling(status) {
+  const id = _progressTimers.get(status);
+  if (id) clearInterval(id);
+}
+
+function pollTranscodeProgress(status, filename) {
+  const bar = status.querySelector('.v-progress');
+  const text = status.querySelector('.v-progress-text');
+  const tick = async () => {
+    let data;
+    try {
+      const res = await fetch(`/api/transcode-progress?filename=${encodeURIComponent(filename)}`);
+      data = await res.json();
+    } catch (e) {
+      return;  // transient fetch failure - just try again next tick
+    }
+    if (data.status === 'done') {
+      stopProgressPolling(status);
+      return;
+    }
+    const pct = Math.round((data.fraction || 0) * 100);
+    bar.value = pct;
+    if (data.status === 'transcoding') {
+      const eta = data.eta_seconds != null ? `, ~${Math.max(1, Math.round(data.eta_seconds))}s left` : '';
+      text.textContent = `${pct}%${eta}`;
+    } else {
+      text.textContent = 'Starting…';
+    }
+  };
+  tick();
+  _progressTimers.set(status, setInterval(tick, 1000));
+}
+
+loadDays();
+</script>
+</body>
+</html>
