@@ -1,0 +1,4 @@
+Flask~=3.1
+gunicorn~=23.0
+# zoneinfo needs a tz database; python:*-slim images don't ship the system one.
+tzdata

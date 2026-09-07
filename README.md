@@ -7,11 +7,12 @@ day's data to view.
 ## Setup
 
 ```bash
-pip install flask
+pip install -r requirements.txt
 ```
 
 Also requires `ffmpeg`/`ffprobe` in PATH (used to transcode HEVC video for
-browser playback - see "How it works" below).
+browser playback - see "How it works" below). If you'd rather not install
+anything, see [Docker](#docker) below.
 
 ## Run
 
@@ -34,6 +35,38 @@ If you want timestamps shown in a diferent timezone than the camera recorded the
 ```bash
 python3 app.py --display-timezone America/Los_Angeles
 ```
+
+`python3 app.py` runs Flask's development server - fine for local use. Every
+flag also has a `DASHCAM_*` environment variable (`DASHCAM_DATA_DIR`,
+`DASHCAM_RECORD_TZ`, `DASHCAM_DISPLAY_TZ`, `DASHCAM_HOST`, `DASHCAM_PORT`) - see
+`python3 app.py --help`.
+
+For a deployment, serve the app factory with gunicorn (this is what the Docker
+image does):
+
+```bash
+gunicorn -c gunicorn.conf.py 'app:create_app()'
+```
+
+`gunicorn.conf.py` pins `workers = 1` on purpose - the app holds per-process
+state (the parsed track index and the transcode coordination), so it scales with
+threads, not worker processes.
+
+## Docker
+
+```bash
+cp .env.example .env          # then edit DASHCAM_DATA_PATH to point at your data
+docker compose up --build -d
+```
+
+Open <http://127.0.0.1:5000>. By default it's published on localhost only; set
+`DASHCAM_BIND=0.0.0.0:5000` in `.env` to reach it from other machines.
+
+- The data directory is mounted **read-only** at `/data`.
+- Transcodes are cached in a named volume (`dashcam-cache`) so they survive
+  restarts; the app prunes anything older than 14 days on its own.
+- `docker compose logs -f` to watch it, `docker compose down` to stop (keeps the
+  cache), `docker compose down -v` to also wipe the cache.
 
 ## How it works
 

@@ -1,0 +1,42 @@
+# Vantrue N4S Dashcam Viewer
+#
+#   cp .env.example .env      # then edit DASHCAM_DATA_PATH
+#   docker compose up --build -d
+#   open http://127.0.0.1:5000
+#
+#   docker compose logs -f
+#   docker compose down            # stop (keeps the transcode cache)
+#   docker compose down -v         # stop and wipe the transcode cache
+
+services:
+  dashcam-viewer:
+    build: .
+    image: dashcam-viewer
+    container_name: dashcam-viewer
+    restart: unless-stopped
+
+    # Left of the last colon is host bind (default: localhost only). Set
+    # DASHCAM_BIND=0.0.0.0:5000 in .env to reach it from other machines.
+    ports:
+      - "${DASHCAM_BIND:-127.0.0.1:5000}:5000"
+
+    environment:
+      DASHCAM_DATA_DIR: /data
+      DASHCAM_RECORD_TZ: "${DASHCAM_RECORD_TZ:-America/Chicago}"
+      DASHCAM_DISPLAY_TZ: "${DASHCAM_DISPLAY_TZ:-}"
+
+    volumes:
+      # The SD card / copy of it, containing Normal/ and GPS/. Read-only.
+      - "${DASHCAM_DATA_PATH:?set DASHCAM_DATA_PATH in .env to your dashcam data directory}:/data:ro"
+      # H.264 transcode cache - persisted so clips aren't re-encoded after a restart.
+      - dashcam-cache:/cache
+
+    # The container runs as uid 1000. If it can't read /data (permission denied
+    # on GPS load), either make the data dir world-readable
+    # (chmod -R a+rX /path/to/data) or uncomment and set this to a uid/gid that
+    # can read it - the dashcam-cache volume is created for uid 1000, so a
+    # different uid also needs it made writable, or just delete the volume once.
+    # user: "1000:1000"
+
+volumes:
+  dashcam-cache:

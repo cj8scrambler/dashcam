@@ -14,6 +14,7 @@ Then open http://localhost:5000 in a browser.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import threading
 from collections import defaultdict
@@ -232,12 +233,19 @@ def _background_transcode(path):
 
 def resolve_data_dir(cli_value: str | None) -> str:
     """
-    --data-dir on the command line always wins and gets cached for next time.
-    Otherwise fall back to the cached path from a previous run.
+    An explicit data dir (--data-dir or $DASHCAM_DATA_DIR) always wins and gets
+    cached for next time. Otherwise fall back to the cached path from a previous
+    run.
     """
     if cli_value:
         resolved = str(Path(cli_value).resolve())
-        config.save_data_dir(resolved)
+        try:
+            config.save_data_dir(resolved)
+        except OSError as e:
+            # Read-only rootfs / unwritable XDG_CONFIG_HOME (common in a
+            # container, where the path is passed in every run anyway) - not
+            # fatal, we already have the value.
+            print(f"WARNING: could not cache data dir ({e}); pass it again next run.")
         return resolved
 
     cached = config.load_data_dir()
@@ -246,42 +254,22 @@ def resolve_data_dir(cli_value: str | None) -> str:
 
     sys.exit(
         "No data directory configured yet. Pass --data-dir /path/to/data "
-        "(it will be remembered for future runs)."
+        "(or set $DASHCAM_DATA_DIR). It will be remembered for future runs."
     )
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--data-dir",
-        help="Directory containing 'Normal' (videos) and 'GPS' (*.dat logs) subdirectories. "
-             "Remembered for future runs once passed; omit to reuse the last one.",
-    )
-    parser.add_argument(
-        "--record-timezone",
-        default="America/Chicago",
-        help="IANA timezone the camera's clock was set to when recording (default: America/Chicago, i.e. CDT/CST). "
-             "All timestamps are converted to UTC internally using this zone.",
-    )
-    parser.add_argument(
-        "--display-timezone",
-        default=None,
-        help="IANA timezone to convert UTC back to for display in the UI. Defaults to --record-timezone.",
-    )
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=5000)
-    parser.add_argument("--debug", action="store_true")
-    args = parser.parse_args()
-
-    data_dir = Path(resolve_data_dir(args.data_dir))
+def _load_state(data_dir: Path, record_tz: ZoneInfo, display_tz: ZoneInfo) -> None:
+    """
+    Parse the GPS logs and scan the video dir under `data_dir`, populating the
+    module-level STATE dict. Called once at startup - by main() for the CLI /
+    dev server, and by create_app() for a WSGI server. There is no reload
+    endpoint; changing the data dir's contents means restarting the process.
+    """
     gps_dir = data_dir / "GPS"
     video_dir = data_dir / "Normal"
     for required in (gps_dir, video_dir):
         if not required.is_dir():
             sys.exit(f"Expected directory not found: {required}")
-
-    record_tz = ZoneInfo(args.record_timezone)
-    display_tz = ZoneInfo(args.display_timezone) if args.display_timezone else record_tz
 
     STATE["fixes"] = load_gps_dir(gps_dir, record_tz=record_tz)
     STATE["video_dir"] = str(video_dir)
@@ -300,9 +288,63 @@ def main():
         print("WARNING: no video segments matched - check video_matcher.py's "
               "FILENAME_PATTERN against your actual filenames.")
 
-    # threaded=True so one video request transcoding in the background (can take
-    # ~1 min on first view of a clip) doesn't block other concurrent requests -
-    # other channels' videos, /api/track, /api/days, etc.
+
+def create_app():
+    """
+    WSGI entry point for a production server. Config comes entirely from the
+    DASHCAM_* environment variables (there are no request-time args to parse):
+
+        gunicorn -c gunicorn.conf.py 'app:create_app()'
+
+    Returns the module-level Flask `app` with STATE already populated.
+    """
+    data_dir = Path(resolve_data_dir(os.environ.get("DASHCAM_DATA_DIR")))
+    record_tz = ZoneInfo(os.environ.get("DASHCAM_RECORD_TZ", "America/Chicago"))
+    display_raw = os.environ.get("DASHCAM_DISPLAY_TZ")
+    display_tz = ZoneInfo(display_raw) if display_raw else record_tz
+    _load_state(data_dir, record_tz, display_tz)
+    return app
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--data-dir",
+        default=os.environ.get("DASHCAM_DATA_DIR"),
+        help="Directory containing 'Normal' (videos) and 'GPS' (*.dat logs) subdirectories. "
+             "Remembered for future runs once passed; omit to reuse the last one. "
+             "Env: DASHCAM_DATA_DIR.",
+    )
+    parser.add_argument(
+        "--record-timezone",
+        default=os.environ.get("DASHCAM_RECORD_TZ", "America/Chicago"),
+        help="IANA timezone the camera's clock was set to when recording (default: America/Chicago, i.e. CDT/CST). "
+             "All timestamps are converted to UTC internally using this zone. Env: DASHCAM_RECORD_TZ.",
+    )
+    parser.add_argument(
+        "--display-timezone",
+        default=os.environ.get("DASHCAM_DISPLAY_TZ") or None,
+        help="IANA timezone to convert UTC back to for display in the UI. Defaults to --record-timezone. "
+             "Env: DASHCAM_DISPLAY_TZ.",
+    )
+    parser.add_argument("--host", default=os.environ.get("DASHCAM_HOST", "127.0.0.1"),
+                        help="Interface to bind (default 127.0.0.1). Env: DASHCAM_HOST.")
+    parser.add_argument("--port", type=int, default=int(os.environ.get("DASHCAM_PORT", "5000")),
+                        help="Port to listen on (default 5000). Env: DASHCAM_PORT.")
+    parser.add_argument("--debug", action="store_true",
+                        default=os.environ.get("DASHCAM_DEBUG", "").lower() in ("1", "true", "yes"),
+                        help="Flask debug mode (reloader + debugger). Env: DASHCAM_DEBUG.")
+    args = parser.parse_args()
+
+    data_dir = Path(resolve_data_dir(args.data_dir))
+    record_tz = ZoneInfo(args.record_timezone)
+    display_tz = ZoneInfo(args.display_timezone) if args.display_timezone else record_tz
+    _load_state(data_dir, record_tz, display_tz)
+
+    # This is the dev / single-user path. threaded=True so a request that's
+    # transcoding on first view of a clip (~1 min) doesn't stall other requests.
+    # For a deployment, run create_app() under gunicorn instead - see
+    # gunicorn.conf.py and the Dockerfile.
     app.run(host=args.host, port=args.port, debug=args.debug, threaded=True)
 
 

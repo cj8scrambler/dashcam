@@ -1,0 +1,16 @@
+.git
+.gitignore
+.venv
+**/__pycache__
+*.pyc
+*.pyo
+.claude
+CLAUDE.md
+notes
+sample_gps.dat
+Dockerfile
+.dockerignore
+docker-compose.yml
+.env
+.env.example
+README.md
