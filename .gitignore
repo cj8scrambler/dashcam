@@ -1,3 +1,5 @@
 .venv
 __pycache__/
 .env
+# local auth state when a bind-mounted ./config is used for dev
+/config/

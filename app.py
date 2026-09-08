@@ -24,6 +24,7 @@ from zoneinfo import ZoneInfo
 
 from flask import Flask, abort, jsonify, render_template, request, send_from_directory
 
+import auth
 import config
 import video_transcode
 from gps_parser import load_gps_dir
@@ -48,7 +49,22 @@ def _local_date(dt_utc, tz) -> str:
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return render_template("index.html", auth_enabled=auth.enabled())
+
+
+@app.route("/healthz")
+def healthz():
+    """
+    Unauthenticated liveness/readiness probe for the container healthcheck.
+    200 only once the GPS data has actually loaded; 503 otherwise.
+    """
+    ready = bool(STATE["fixes"]) or bool(STATE["video_segments"])
+    return (
+        jsonify({"status": "ok" if ready else "loading",
+                 "fixes": len(STATE["fixes"]),
+                 "segments": len(STATE["video_segments"])}),
+        200 if ready else 503,
+    )
 
 
 @app.route("/api/days")
@@ -258,6 +274,13 @@ def resolve_data_dir(cli_value: str | None) -> str:
     )
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
 def _load_state(data_dir: Path, record_tz: ZoneInfo, display_tz: ZoneInfo) -> None:
     """
     Parse the GPS logs and scan the video dir under `data_dir`, populating the
@@ -284,6 +307,7 @@ def _load_state(data_dir: Path, record_tz: ZoneInfo, display_tz: ZoneInfo) -> No
 
     print(f"Loaded {len(STATE['fixes'])} GPS fixes from {gps_dir}")
     print(f"Found {len(STATE['video_segments'])} video segments in {video_dir}")
+    print(f"Transcoder: {video_transcode.encoder_summary()}")
     if STATE["fixes"] and not STATE["video_segments"]:
         print("WARNING: no video segments matched - check video_matcher.py's "
               "FILENAME_PATTERN against your actual filenames.")
@@ -296,13 +320,23 @@ def create_app():
 
         gunicorn -c gunicorn.conf.py 'app:create_app()'
 
-    Returns the module-level Flask `app` with STATE already populated.
+    Returns the module-level Flask `app` with STATE populated and auth wired up.
     """
     data_dir = Path(resolve_data_dir(os.environ.get("DASHCAM_DATA_DIR")))
     record_tz = ZoneInfo(os.environ.get("DASHCAM_RECORD_TZ", "America/Chicago"))
     display_raw = os.environ.get("DASHCAM_DISPLAY_TZ")
     display_tz = ZoneInfo(display_raw) if display_raw else record_tz
     _load_state(data_dir, record_tz, display_tz)
+
+    # Secure cookies by default here - a deployment is behind TLS (nginx). Set
+    # DASHCAM_SECURE_COOKIE=0 only if you're knowingly serving plain HTTP.
+    auth.init_app(app, secure_cookie=_env_bool("DASHCAM_SECURE_COOKIE", True))
+    if _env_bool("DASHCAM_REQUIRE_AUTH", True) and not auth.enabled():
+        sys.exit(
+            "DASHCAM_REQUIRE_AUTH is on but no users are configured. Create one:\n"
+            "  docker compose run --rm dashcam-viewer python app.py adduser <name>\n"
+            "(or set DASHCAM_REQUIRE_AUTH=0 to run without a login)."
+        )
     return app
 
 
@@ -334,17 +368,37 @@ def main():
     parser.add_argument("--debug", action="store_true",
                         default=os.environ.get("DASHCAM_DEBUG", "").lower() in ("1", "true", "yes"),
                         help="Flask debug mode (reloader + debugger). Env: DASHCAM_DEBUG.")
+
+    sub = parser.add_subparsers(dest="command")
+    p_add = sub.add_parser("adduser", help="Create or update a login (prompts for a password).")
+    p_add.add_argument("username")
+    p_del = sub.add_parser("deluser", help="Remove a login.")
+    p_del.add_argument("username")
+    sub.add_parser("listusers", help="List configured logins.")
+
     args = parser.parse_args()
+
+    # User-management subcommands: touch only auth's files, then exit.
+    if args.command == "adduser":
+        auth.add_user_interactive(args.username)
+        return
+    if args.command == "deluser":
+        auth.delete_user(args.username)
+        return
+    if args.command == "listusers":
+        auth.list_users()
+        return
 
     data_dir = Path(resolve_data_dir(args.data_dir))
     record_tz = ZoneInfo(args.record_timezone)
     display_tz = ZoneInfo(args.display_timezone) if args.display_timezone else record_tz
     _load_state(data_dir, record_tz, display_tz)
 
-    # This is the dev / single-user path. threaded=True so a request that's
-    # transcoding on first view of a clip (~1 min) doesn't stall other requests.
-    # For a deployment, run create_app() under gunicorn instead - see
-    # gunicorn.conf.py and the Dockerfile.
+    # Dev / single-user path. Auth still applies if users exist, but insecure
+    # cookies by default so login works over plain-HTTP localhost. threaded=True
+    # so a first-view transcode (~1 min) doesn't stall other requests. For a
+    # deployment, run create_app() under gunicorn - see gunicorn.conf.py.
+    auth.init_app(app, secure_cookie=_env_bool("DASHCAM_SECURE_COOKIE", False))
     app.run(host=args.host, port=args.port, debug=args.debug, threaded=True)
 
 

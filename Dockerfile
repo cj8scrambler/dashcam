@@ -1,10 +1,13 @@
 # Vantrue N4S Dashcam Viewer
 #
-#   docker compose up --build
+#   docker compose build
+#   docker compose run --rm dashcam-viewer python app.py adduser <name>   # first login
+#   docker compose up -d
 #
 # Config is entirely via env vars (see .env.example / docker-compose.yml);
-# no CLI args are needed. Mount the dashcam data directory read-only at /data
-# and give /cache a persistent volume so transcodes survive restarts.
+# no CLI args are needed. Mount the dashcam data directory read-only at /data,
+# a persistent /cache volume for transcodes, and a host bind mount at /config
+# for users.json + secret_key (see DASHCAM_CONFIG_PATH).
 
 FROM python:3.12-slim
 
@@ -35,15 +38,16 @@ ENV DASHCAM_HOST=0.0.0.0 \
     DASHCAM_PORT=5000 \
     DASHCAM_THREADS=16 \
     XDG_CACHE_HOME=/cache \
-    XDG_CONFIG_HOME=/config \
+    DASHCAM_CONFIG_DIR=/config \
     PYTHONUNBUFFERED=1
 
 EXPOSE 5000
 
-# urlopen raises (non-zero exit) on any non-2xx or connection failure. /api/days
-# needs the parsed GPS state, so this also confirms the data load succeeded.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-  CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/api/days', timeout=4)"]
+# /healthz is unauthenticated and 200 only once the GPS data has loaded, so this
+# checks both "process up" and "data parsed". urlopen raises (-> non-zero exit)
+# on any non-2xx or connection failure.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
+  CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/healthz', timeout=4)"]
 
 # gunicorn with the app factory. Config (crucially workers=1) is in
 # gunicorn.conf.py. Override the command to get a shell or `python app.py --help`.

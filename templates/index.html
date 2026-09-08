@@ -48,6 +48,9 @@
     .video-block.gap .video-gap-note { display: flex; }
     #info { padding: 10px; border-top: 1px solid #2a2d36; font-size: 13px; color: #c3c8d4; }
     #info b { color: #fff; }
+    #signout { padding: 8px 10px; border-top: 1px solid #2a2d36; font-size: 12px; }
+    #signout a { color: #6b7280; text-decoration: none; }
+    #signout a:hover { color: #e7e9ee; }
     #legend { position: absolute; bottom: 24px; left: 10px; background: rgba(20,22,28,0.9); padding: 8px 12px; border-radius: 6px; font-size: 12px; color: #e7e9ee; z-index: 1000; }
     #legend .grad { width: 200px; height: 10px; border-radius: 3px; margin: 4px 0; }
     .empty-msg { color: #666; font-size: 13px; padding: 10px; }
@@ -112,10 +115,23 @@
       <button id="theater-exit">&larr; Back to map</button>
       <div id="videos"><div class="empty-msg">Select a day with data, then click a point on the track.</div></div>
       <div id="info">Select a day on the calendar to load its track.</div>
+      {% if auth_enabled %}<div id="signout"><a href="/logout">Sign out</a></div>{% endif %}
     </div>
   </div>
 
 <script>
+// fetch() wrapper: if the session has gone away (cookie cleared, secret key
+// rotated), the backend answers API calls with 401 - bounce to the login page
+// rather than letting the UI fail silently.
+async function apiFetch(url) {
+  const res = await fetch(url);
+  if (res.status === 401) {
+    window.location = '/login';
+    throw new Error('not authenticated');
+  }
+  return res;
+}
+
 const CHANNEL_ORDER = ["front", "interior", "rear"];
 let track = [];
 let daysWithData = new Map();   // "YYYY-MM-DD" -> count
@@ -211,7 +227,7 @@ function findFirstTrackPointAtOrAfter(ms) {
 }
 
 async function loadDays() {
-  const res = await fetch('/api/days');
+  const res = await apiFetch('/api/days');
   const days = await res.json();
   daysWithData = new Map(days.map(d => [d.date, d.count]));
 
@@ -279,7 +295,7 @@ async function selectDay(dateStr) {
   selectedDate = dateStr;
   renderCalendar();
 
-  const res = await fetch(`/api/track?date=${encodeURIComponent(dateStr)}`);
+  const res = await apiFetch(`/api/track?date=${encodeURIComponent(dateStr)}`);
   track = await res.json();
   trackMs = track.map(p => Date.parse(p.t));
 
@@ -452,7 +468,7 @@ async function onPointClick(point, { autoplay = false } = {}) {
     `Lat/Lon: ${point.lat.toFixed(6)}, ${point.lon.toFixed(6)}`;
   updatePositionMarker(point);
 
-  const res = await fetch(`/api/videos?ts=${encodeURIComponent(point.t)}`);
+  const res = await apiFetch(`/api/videos?ts=${encodeURIComponent(point.t)}`);
   const segments = await res.json();
   const container = document.getElementById('videos');
   container.innerHTML = '';
@@ -548,7 +564,7 @@ function pollTranscodeProgress(status, filename) {
   const tick = async () => {
     let data;
     try {
-      const res = await fetch(`/api/transcode-progress?filename=${encodeURIComponent(filename)}`);
+      const res = await apiFetch(`/api/transcode-progress?filename=${encodeURIComponent(filename)}`);
       data = await res.json();
     } catch (e) {
       return;  // transient fetch failure - just try again next tick

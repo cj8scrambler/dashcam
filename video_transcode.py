@@ -2,8 +2,15 @@
 Transparent H.264 transcode cache for dashcam footage.
 
 The Vantrue N4S records HEVC (H.265) video. Chrome (and most browsers) can't
-decode HEVC in a <video> element.  Videos are transcoded with
-software libx264 and downscaled to keep the wait tolerable on first view.
+decode HEVC in a <video> element, so every clip is transcoded to H.264 and
+downscaled on first view.
+
+Encoder is chosen by $DASHCAM_HWACCEL:
+  - "none" (default): software libx264, "ultrafast" preset. Works anywhere.
+  - "nvenc": NVIDIA GPU - CUDA decode -> scale_cuda -> h264_nvenc, entirely on
+    the GPU. Needs an NVIDIA GPU exposed to the container (nvidia-container-
+    toolkit). Probed once at startup; if it can't initialise, or a real encode
+    later fails, the code logs and falls back to software per file.
 
 Each source file is transcoded once and cached under the user's XDG cache
 dir (outside the repo), keyed by its resolved path. Cached files older than
@@ -19,12 +26,32 @@ import subprocess
 import tempfile
 import threading
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
-# EDIT ME to trade off transcode speed against quality/size.
+# "none" -> software libx264; "nvenc" -> NVIDIA GPU. See module docstring.
+HWACCEL = os.environ.get("DASHCAM_HWACCEL", "none").strip().lower()
+
+# Software libx264 knobs - also the fallback whenever nvenc isn't usable.
 FFMPEG_PRESET = "ultrafast"
 FFMPEG_CRF = "26"
+
+# NVENC knobs. Presets p1 (fastest) .. p7 (slowest); p5 is comfortably above
+# libx264 "ultrafast" quality and still several times faster than realtime.
+# -cq is NVENC's CRF-equivalent constant-quality control.
+NVENC_PRESET = "p5"
+NVENC_CQ = "26"
+
 SCALE_WIDTH = "1280"  # output width in pixels; height auto-scales to preserve aspect ratio
+
+# GeForce cards cap simultaneous NVENC sessions (historically 3, more on recent
+# drivers). Gate ffmpeg launches so a burst of cold-segment requests queues
+# instead of erroring out. Only applied on the nvenc path.
+_NVENC_MAX_CONCURRENT = max(1, int(os.environ.get("DASHCAM_HWACCEL_CONCURRENCY", "3")))
+_nvenc_sem = threading.BoundedSemaphore(_NVENC_MAX_CONCURRENT)
+
+_nvenc_state_lock = threading.Lock()
+_nvenc_usable_cached: bool | None = None
 
 # depend on the filesystem's atime tracking being enabled.
 MAX_CACHE_AGE_DAYS = 14
@@ -107,6 +134,128 @@ TRUNCATION_TOLERANCE_S = 3.0
 # corruption) - which the duration check alone misses, since the moov atom is
 # written up front with -movflags +faststart.
 TAIL_TOLERANCE_S = 5.0
+
+
+# --------------------------------------------------------------------------- #
+# Encoder selection (software libx264 vs NVIDIA nvenc)
+# --------------------------------------------------------------------------- #
+
+def _nvenc_usable() -> bool:
+    """
+    True if h264_nvenc can actually initialise here (GPU visible, driver OK, a
+    session available). Probed once with a trivial encode and cached for the
+    process; a hard failure during a real transcode flips it off (_disable_nvenc).
+    """
+    global _nvenc_usable_cached
+    with _nvenc_state_lock:
+        if _nvenc_usable_cached is not None:
+            return _nvenc_usable_cached
+        try:
+            r = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-loglevel", "error",
+                 "-f", "lavfi", "-i", "color=c=black:s=256x256:d=0.1",
+                 "-c:v", "h264_nvenc", "-f", "null", "-"],
+                capture_output=True, text=True, timeout=30,
+            )
+            ok = r.returncode == 0
+            if not ok:
+                print(f"NVENC requested but not usable here - using software encoder. "
+                      f"ffmpeg: {(r.stderr or '').strip()[-300:]}")
+        except (OSError, subprocess.SubprocessError) as e:
+            ok = False
+            print(f"NVENC probe failed ({e}) - using software encoder.")
+        _nvenc_usable_cached = ok
+        return ok
+
+
+def _disable_nvenc(reason: str) -> None:
+    global _nvenc_usable_cached
+    with _nvenc_state_lock:
+        if _nvenc_usable_cached is not False:
+            print(f"Disabling NVENC for the rest of this run ({reason}); using software.")
+        _nvenc_usable_cached = False
+
+
+def encoder_summary() -> str:
+    """One-line description of the active encoder, for a startup log line."""
+    if HWACCEL == "nvenc":
+        if _nvenc_usable():
+            return (f"NVIDIA nvenc (h264_nvenc {NVENC_PRESET}/cq{NVENC_CQ}, "
+                    f"≤{_NVENC_MAX_CONCURRENT} concurrent), software libx264 fallback")
+        return "software libx264 (DASHCAM_HWACCEL=nvenc set, but no usable GPU here)"
+    return f"software libx264 ({FFMPEG_PRESET}, crf {FFMPEG_CRF})"
+
+
+def _ffmpeg_cmd(src: Path, tmp_dest: Path, *, gpu: bool) -> list[str]:
+    tail = [
+        "-c:a", "aac",
+        "-movflags", "+faststart",
+        "-f", "mp4",  # tmp_dest ends ".mp4.partial" - ffmpeg can't infer the muxer
+        "-progress", "pipe:1", "-nostats",
+        str(tmp_dest),
+    ]
+    if gpu:
+        # Decode on the GPU (-hwaccel cuda), keep frames in GPU memory
+        # (-hwaccel_output_format cuda), resize and encode there too - no
+        # CPU<->GPU frame copies anywhere in the pipeline.
+        return [
+            "ffmpeg", "-y",
+            "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
+            "-i", str(src),
+            "-vf", f"scale_cuda={SCALE_WIDTH}:-2",
+            "-c:v", "h264_nvenc", "-preset", NVENC_PRESET, "-cq", NVENC_CQ, "-b:v", "0",
+            *tail,
+        ]
+    return [
+        "ffmpeg", "-y",
+        "-i", str(src),
+        "-vf", f"scale={SCALE_WIDTH}:-2",
+        "-c:v", "libx264", "-preset", FFMPEG_PRESET, "-crf", FFMPEG_CRF,
+        *tail,
+    ]
+
+
+def _run_transcode(src: Path, tmp_dest: Path, dest: Path, total_s: float, *, gpu: bool) -> None:
+    """
+    One ffmpeg pass into tmp_dest. Streams progress into _progress[dest] as it
+    runs; raises RuntimeError if ffmpeg fails or the output is truncated/corrupt.
+    The caller renames tmp_dest -> dest on success.
+    """
+    _progress[dest] = {"total_s": total_s, "current_s": 0.0, "started_at": time.monotonic()}
+    label = "nvenc" if gpu else "libx264"
+    limiter = _nvenc_sem if gpu else nullcontext()
+    try:
+        with limiter:
+            # stderr to a temp file, not a pipe: read back only on failure.
+            # Two live pipes (progress on stdout, logs on stderr) without
+            # threads/select risks a classic subprocess deadlock.
+            with tempfile.TemporaryFile(mode="w+") as stderr_log:
+                proc = subprocess.Popen(
+                    _ffmpeg_cmd(src, tmp_dest, gpu=gpu),
+                    stdout=subprocess.PIPE, stderr=stderr_log, text=True, bufsize=1,
+                )
+                for line in proc.stdout:
+                    key, _, value = line.strip().partition("=")
+                    if key == "out_time_us":
+                        try:
+                            _progress[dest] = {**_progress[dest], "current_s": int(value) / 1_000_000}
+                        except ValueError:
+                            pass
+                proc.wait()
+                if proc.returncode != 0:
+                    stderr_log.seek(0)
+                    raise RuntimeError(f"ffmpeg ({label}) failed for {src}:\n{stderr_log.read()[-2000:]}")
+
+        # ffmpeg can exit 0 yet leave a truncated file if a source read failed
+        # partway (flaky media) - don't cache that, don't let it look "done".
+        if not _looks_complete(tmp_dest, src):
+            out_s = _probe_duration_seconds(tmp_dest)
+            raise RuntimeError(
+                f"ffmpeg ({label}) produced an incomplete file for {src}: "
+                f"{out_s}s of {total_s}s source - read error on the source media?"
+            )
+    finally:
+        _progress.pop(dest, None)
 
 
 def _probe_duration_seconds(src: Path) -> float | None:
@@ -235,7 +384,9 @@ def ensure_transcoded(src: Path, *, rebuild_corrupt: bool = True) -> Path | None
         if the copy was corrupt, evict it and return None, leaving the rebuild
         for whenever the file is actually requested.
 
-    Raises RuntimeError if ffmpeg fails or produces a truncated file.
+    Uses the GPU (nvenc) when DASHCAM_HWACCEL=nvenc and it's usable, retrying
+    once with software libx264 if the GPU pass fails. Raises RuntimeError only
+    if that fallback also fails or the output is truncated.
     """
     _prune_stale_cache()
 
@@ -258,58 +409,24 @@ def ensure_transcoded(src: Path, *, rebuild_corrupt: bool = True) -> Path | None
 
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         tmp_dest = dest.with_suffix(".mp4.partial")
-
         total_s = _probe_duration_seconds(src) or 0.0
-        _progress[dest] = {"total_s": total_s, "current_s": 0.0, "started_at": time.monotonic()}
 
-        # stderr goes to a temp file rather than a pipe: we only read it back
-        # on failure, and reading two live pipes (stdout for progress, stderr
-        # for logs) at once without threads/select risks a classic
-        # subprocess deadlock if either fills its OS buffer.
-        with tempfile.TemporaryFile(mode="w+") as stderr_log:
-            proc = subprocess.Popen(
-                [
-                    "ffmpeg", "-y",
-                    "-i", str(src),
-                    "-vf", f"scale={SCALE_WIDTH}:-2",
-                    "-c:v", "libx264", "-preset", FFMPEG_PRESET, "-crf", FFMPEG_CRF,
-                    "-c:a", "aac",
-                    "-movflags", "+faststart",
-                    "-f", "mp4",  # tmp_dest ends in ".mp4.partial" - ffmpeg can't infer the muxer from that
-                    "-progress", "pipe:1", "-nostats",
-                    str(tmp_dest),
-                ],
-                stdout=subprocess.PIPE, stderr=stderr_log, text=True, bufsize=1,
-            )
+        # Try the GPU first when it's wanted and looks usable; on any failure
+        # there, retry once with software (and stop using the GPU this run).
+        want_gpu = HWACCEL == "nvenc" and _nvenc_usable()
+        attempts = [True, False] if want_gpu else [False]
+        last_error: Exception | None = None
+        for gpu in attempts:
             try:
-                for line in proc.stdout:
-                    key, _, value = line.strip().partition("=")
-                    if key == "out_time_us":
-                        try:
-                            _progress[dest] = {**_progress[dest], "current_s": int(value) / 1_000_000}
-                        except ValueError:
-                            pass
-                proc.wait()
-
-                if proc.returncode != 0:
-                    stderr_log.seek(0)
-                    err_text = stderr_log.read()[-2000:]
-                    tmp_dest.unlink(missing_ok=True)
-                    raise RuntimeError(f"ffmpeg transcode failed for {src}:\n{err_text}")
-
-                # ffmpeg can exit 0 yet leave a truncated file if a read from
-                # the source failed partway (flaky USB media) - don't cache
-                # that, and don't let it look "done" to the UI.
-                if not _looks_complete(tmp_dest, src):
-                    out_s = _probe_duration_seconds(tmp_dest)
-                    tmp_dest.unlink(missing_ok=True)
-                    raise RuntimeError(
-                        f"ffmpeg produced an incomplete file for {src}: "
-                        f"{out_s}s of {total_s}s source - read error on the source media?"
-                    )
-
+                _run_transcode(src, tmp_dest, dest, total_s, gpu=gpu)
                 tmp_dest.rename(dest)  # atomic - concurrent requests never see a partial file
                 _validated.add(dest)
                 return dest
-            finally:
-                _progress.pop(dest, None)
+            except RuntimeError as e:
+                last_error = e
+                tmp_dest.unlink(missing_ok=True)
+                if gpu:
+                    _disable_nvenc(f"transcode of {src.name} failed")
+                    print(f"WARNING: GPU transcode failed for {src.name}; retrying with software.\n{e}")
+
+        raise last_error

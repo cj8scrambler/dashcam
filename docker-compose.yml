@@ -1,12 +1,15 @@
 # Vantrue N4S Dashcam Viewer
 #
-#   cp .env.example .env      # then edit DASHCAM_DATA_PATH
-#   docker compose up --build -d
+#   cp .env.example .env      # then edit DASHCAM_DATA_PATH and DASHCAM_CONFIG_PATH
+#   docker compose build
+#   docker compose run --rm dashcam-viewer python app.py adduser <name>   # create a login
+#   docker compose up -d
 #   open http://127.0.0.1:5000
 #
 #   docker compose logs -f
-#   docker compose down            # stop (keeps the transcode cache)
-#   docker compose down -v         # stop and wipe the transcode cache
+#   docker compose down            # stop (keeps the transcode cache and logins)
+#   docker compose down -v         # also wipe the transcode cache (logins are a
+#                                  # host bind mount, so they survive this)
 
 services:
   dashcam-viewer:
@@ -15,8 +18,9 @@ services:
     container_name: dashcam-viewer
     restart: unless-stopped
 
-    # Left of the last colon is host bind (default: localhost only). Set
-    # DASHCAM_BIND=0.0.0.0:5000 in .env to reach it from other machines.
+    # Left of the last colon is host bind (default: localhost only, so nginx on
+    # the host is the only thing exposed). Set DASHCAM_BIND=0.0.0.0:5000 in .env
+    # only if you're reaching it directly without a reverse proxy.
     ports:
       - "${DASHCAM_BIND:-127.0.0.1:5000}:5000"
 
@@ -24,19 +28,47 @@ services:
       DASHCAM_DATA_DIR: /data
       DASHCAM_RECORD_TZ: "${DASHCAM_RECORD_TZ:-America/Chicago}"
       DASHCAM_DISPLAY_TZ: "${DASHCAM_DISPLAY_TZ:-}"
+      # Require a configured login before the app will start. Set to 0 only if
+      # you deliberately want it open (e.g. it's already behind another gate).
+      DASHCAM_REQUIRE_AUTH: "${DASHCAM_REQUIRE_AUTH:-1}"
+      # Session cookies are Secure by default (assumes TLS at the proxy). Set to
+      # 0 only if you're serving plain HTTP.
+      DASHCAM_SECURE_COOKIE: "${DASHCAM_SECURE_COOKIE:-1}"
+      # Transcoder: "none" (software libx264, default) or "nvenc" (NVIDIA GPU).
+      # For "nvenc" also uncomment the `deploy:` block AND the capabilities line
+      # just below.
+      DASHCAM_HWACCEL: "${DASHCAM_HWACCEL:-none}"
+      DASHCAM_HWACCEL_CONCURRENCY: "${DASHCAM_HWACCEL_CONCURRENCY:-3}"
+      # NVIDIA_DRIVER_CAPABILITIES: "compute,video,utility"   # needed for nvenc
 
     volumes:
       # The SD card / copy of it, containing Normal/ and GPS/. Read-only.
       - "${DASHCAM_DATA_PATH:?set DASHCAM_DATA_PATH in .env to your dashcam data directory}:/data:ro"
-      # H.264 transcode cache - persisted so clips aren't re-encoded after a restart.
+      # users.json + secret_key. A host bind mount (not a named volume) so the
+      # logins are plain files you can back up and `docker compose down -v` can't
+      # wipe. Must be writable by uid 1000 - see .env.example.
+      - "${DASHCAM_CONFIG_PATH:?set DASHCAM_CONFIG_PATH in .env}:/config"
+      # H.264 transcode cache - regenerable, fine to wipe.
       - dashcam-cache:/cache
 
     # The container runs as uid 1000. If it can't read /data (permission denied
-    # on GPS load), either make the data dir world-readable
-    # (chmod -R a+rX /path/to/data) or uncomment and set this to a uid/gid that
-    # can read it - the dashcam-cache volume is created for uid 1000, so a
-    # different uid also needs it made writable, or just delete the volume once.
+    # on GPS load) or write /config, either fix ownership on the host
+    # (chown 1000:1000 <config dir>; chmod -R a+rX <data dir>) or uncomment and
+    # set this to a uid/gid that can - then also chown the dashcam-cache volume
+    # or delete it once so it's recreated for that uid.
     # user: "1000:1000"
+
+    # GPU transcoding: needs nvidia-container-toolkit on the host. Uncomment
+    # this block, set DASHCAM_HWACCEL=nvenc, and uncomment
+    # NVIDIA_DRIVER_CAPABILITIES above (the "video" cap is what exposes
+    # NVENC/NVDEC - CUDA compute alone isn't enough).
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
 
 volumes:
   dashcam-cache:

@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in &middot; Dashcam Viewer</title>
+  <style>
+    html, body { height: 100%; margin: 0; font-family: system-ui, sans-serif; background: #12141a; color: #e7e9ee; }
+    .wrap { min-height: 100%; display: flex; align-items: center; justify-content: center; padding: 20px; box-sizing: border-box; }
+    form { background: #181b22; border: 1px solid #2a2d36; border-radius: 10px; padding: 28px; width: 100%; max-width: 320px; }
+    h1 { margin: 0 0 4px; font-size: 18px; }
+    p.sub { margin: 0 0 18px; color: #9aa2b1; font-size: 13px; }
+    label { display: block; font-size: 11px; color: #9aa2b1; margin: 12px 0 4px; text-transform: uppercase; letter-spacing: 0.05em; }
+    input { width: 100%; box-sizing: border-box; padding: 9px 10px; border-radius: 6px; border: 1px solid #2a2d36; background: #0e1015; color: #e7e9ee; font-size: 14px; }
+    input:focus { outline: none; border-color: #2b6cff; }
+    button { width: 100%; margin-top: 18px; padding: 10px; border: none; border-radius: 6px; background: #2b6cff; color: #fff; font-size: 14px; font-weight: 600; cursor: pointer; }
+    button:hover { background: #1d5ae0; }
+    .error { margin-top: 14px; color: #ef6b6b; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <form method="post">
+      <h1>Dashcam Viewer</h1>
+      <p class="sub">Sign in to continue</p>
+      <label for="username">Username</label>
+      <input id="username" name="username" autocomplete="username" autofocus required>
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required>
+      <button type="submit">Sign in</button>
+      {% if error %}<div class="error">{{ error }}</div>{% endif %}
+    </form>
+  </div>
+</body>
+</html>

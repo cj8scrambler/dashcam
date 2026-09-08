@@ -55,18 +55,64 @@ threads, not worker processes.
 ## Docker
 
 ```bash
-cp .env.example .env          # then edit DASHCAM_DATA_PATH to point at your data
-docker compose up --build -d
+cp .env.example .env          # edit DASHCAM_DATA_PATH and DASHCAM_CONFIG_PATH
+
+# one-time: create the host dir that holds the logins (writable by uid 1000)
+sudo mkdir -p /srv/dashcam/config && sudo chown 1000:1000 /srv/dashcam/config
+
+docker compose build
+docker compose run --rm dashcam-viewer python app.py adduser me   # prompts for a password
+docker compose up -d
 ```
 
-Open <http://127.0.0.1:5000>. By default it's published on localhost only; set
-`DASHCAM_BIND=0.0.0.0:5000` in `.env` to reach it from other machines.
+Open <http://127.0.0.1:5000>. Published on localhost only by default - it's meant
+to sit behind your existing nginx, which terminates TLS. Point an nginx
+`location` at `http://127.0.0.1:5000`; no other nginx auth is needed, the app
+handles login itself.
 
 - The data directory is mounted **read-only** at `/data`.
-- Transcodes are cached in a named volume (`dashcam-cache`) so they survive
-  restarts; the app prunes anything older than 14 days on its own.
-- `docker compose logs -f` to watch it, `docker compose down` to stop (keeps the
-  cache), `docker compose down -v` to also wipe the cache.
+- Transcodes are cached in a named volume (`dashcam-cache`) - regenerable, so
+  `docker compose down -v` may wipe it; the app prunes anything older than 14 days.
+- Logins (`users.json`) and the session key (`secret_key`) live in
+  `DASHCAM_CONFIG_PATH` on the host as plain files - back them up; `down -v`
+  leaves them alone.
+- `docker compose logs -f` to watch it.
+
+### Logins
+
+Auth is on whenever at least one user exists; with `DASHCAM_REQUIRE_AUTH=1`
+(the default) the container refuses to start with no users.
+
+```bash
+docker compose run --rm dashcam-viewer python app.py adduser <name>    # add / reset a password
+docker compose run --rm dashcam-viewer python app.py deluser <name>
+docker compose run --rm dashcam-viewer python app.py listusers
+```
+
+`adduser` / `deluser` take effect immediately - no restart. Sessions don't
+expire; to force everyone to log in again, delete `secret_key` from
+`DASHCAM_CONFIG_PATH` and restart.
+
+Session cookies are marked `Secure` (HTTPS only) by default. If you ever reach
+the container directly over plain HTTP instead of through the TLS proxy, set
+`DASHCAM_SECURE_COOKIE=0` or login will appear to do nothing.
+
+### GPU transcoding (optional)
+
+By default clips are transcoded with software `libx264` (~1 min for a cold
+5-minute clip). On a host with an NVIDIA GPU you can offload the whole pipeline
+(CUDA decode → resize → `h264_nvenc`) to the GPU, cutting that to ~10-20 s and
+freeing the CPU:
+
+1. Install `nvidia-container-toolkit` on the host.
+2. In `docker-compose.yml`, uncomment the `deploy:` block and the
+   `NVIDIA_DRIVER_CAPABILITIES` line.
+3. Set `DASHCAM_HWACCEL=nvenc` in `.env`.
+
+The app probes the GPU at startup (see the `Transcoder:` log line) and falls
+back to software per-clip if it isn't usable, so a misconfigured GPU degrades
+rather than breaks. `DASHCAM_HWACCEL_CONCURRENCY` (default 3) caps simultaneous
+NVENC encodes — GeForce cards limit these.
 
 ## How it works
 
@@ -92,7 +138,8 @@ Open <http://127.0.0.1:5000>. By default it's published on localhost only; set
   transcodes each clip to H.264 the first time it's viewed and caches the
   result under `~/.cache/dashcam-viewer/transcoded/`, subsequent views of
   the same clip are instant. First view of a clip takes roughly a minute
-  with software encode; the frontend shows live progress. Each cached file is
+  with the software encoder, or ~10-20 s on an NVIDIA GPU
+  (`DASHCAM_HWACCEL=nvenc`); the frontend shows live progress. Each cached file is
   sanity-checked before use; a bad one is deleted and rebuilt the next time
   that clip is actually requested. Cached clips older
   than `MAX_CACHE_AGE_DAYS` are deleted automatically so the cache doesn't grow

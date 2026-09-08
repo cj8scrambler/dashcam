@@ -14,3 +14,5 @@ docker-compose.yml
 .env
 .env.example
 README.md
+config
+gunicorn-dev.log

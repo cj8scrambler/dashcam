@@ -11,7 +11,12 @@ import json
 import os
 from pathlib import Path
 
-CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "dashcam-viewer"
+# $DASHCAM_CONFIG_DIR wins (the Docker image sets it to /config, a bind mount);
+# otherwise the XDG location. auth.py reads users.json / secret_key from here too.
+CONFIG_DIR = Path(
+    os.environ.get("DASHCAM_CONFIG_DIR")
+    or Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "dashcam-viewer"
+)
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
 
