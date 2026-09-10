@@ -20,6 +20,8 @@ services:
     image: dashcam-viewer
     container_name: dashcam-viewer
     restart: unless-stopped
+    networks:
+      - app-net
 
     # Left of the last colon is host bind (default: localhost only, so nginx on
     # the host is the only thing exposed). Set DASHCAM_BIND=0.0.0.0:5000 in .env
@@ -88,6 +90,8 @@ services:
     image: atmoz/sftp:alpine
     container_name: dashcam-sftp
     restart: unless-stopped
+    networks:
+      - app-net
 
     # Bind to the private VLAN interface only - never 0.0.0.0.
     ports:
@@ -104,6 +108,9 @@ services:
       # persist SSH host keys so the daemon doesn't get host-key-changed warnings
       - "${DASHCAM_CONFIG_PATH:?}/sftp/ssh_host_ed25519_key:/etc/ssh/ssh_host_ed25519_key"
       - "${DASHCAM_CONFIG_PATH:?}/sftp/ssh_host_rsa_key:/etc/ssh/ssh_host_rsa_key"
+networks:
+  app-net:
+    external: true
 
 volumes:
   dashcam-cache:
