@@ -12,6 +12,10 @@ a bare "#" separator line between recording sessions - both fail float/date
 parsing and are dropped by the same malformed-row handling as blank lines,
 not treated specially.
 
+Rows where a coordinate is 0.000000 (the camera still acquiring, or a degraded
+fix while parked) are also dropped - they're well-formed but would otherwise
+plot on the equator / prime meridian.
+
 A single .dat file may contain rows spanning more than one calendar day.
 Timestamps are naive wall-clock time in the camera's configured timezone
 (--record-timezone); every fix is converted to UTC on load so the rest of
@@ -33,6 +37,13 @@ from zoneinfo import ZoneInfo
 
 KNOTS_TO_MPH = 1.15078
 KNOTS_TO_KMH = 1.852
+
+# The camera writes 0.000000 for a coordinate it doesn't have yet (GPS still
+# acquiring, or degraded while parked). Those rows are otherwise well-formed, so
+# they'd otherwise plot as real fixes on the equator / prime meridian and draw a
+# polyline straight out to Null Island and back. A coordinate that rounds to
+# zero is never a real position for this camera's use, so drop the whole fix.
+_ZERO_COORD_EPSILON = 1e-4
 
 
 @dataclass
@@ -83,6 +94,8 @@ def parse_gps_log(path: str | Path, record_tz: ZoneInfo) -> list[GpsFix]:
             except ValueError:
                 # Malformed row - skip rather than crash the whole load
                 continue
+            if abs(lat) < _ZERO_COORD_EPSILON or abs(lon) < _ZERO_COORD_EPSILON:
+                continue  # 0.000000 in a coordinate = no fix, not a trip to Null Island
             fixes.append(GpsFix(ts_utc, lat, lon, speed_knots, altitude_m))
     return fixes
 
