@@ -33,3 +33,12 @@ preload_app = True
 
 accesslog = "-"
 errorlog = "-"
+
+
+def post_fork(server, worker):
+    # The periodic re-scan thread must live in the worker: preload_app runs
+    # create_app() in the master, and the worker only inherits a *copy* of its
+    # STATE, so a thread started in the master would reload state the worker
+    # never sees. post_fork runs in each worker after the fork.
+    import app
+    app.start_rescan_thread()

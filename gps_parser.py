@@ -16,10 +16,15 @@ A single .dat file may contain rows spanning more than one calendar day.
 Timestamps are naive wall-clock time in the camera's configured timezone
 (--record-timezone); every fix is converted to UTC on load so the rest of
 the app never has to reason about camera-local time.
+
+load_gps_dir() caches each file's parsed fixes keyed by (mtime_ns, size, tz),
+so a re-scan (app.reload_state) only re-parses the file(s) that actually grew -
+which, once footage is syncing in, is normally just the current day's log.
 """
 from __future__ import annotations
 
 import csv
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -82,12 +87,44 @@ def parse_gps_log(path: str | Path, record_tz: ZoneInfo) -> list[GpsFix]:
     return fixes
 
 
+# path -> (mtime_ns, size, tz_key, [GpsFix]). Guarded by _cache_lock so
+# concurrent load_gps_dir() calls (a periodic re-scan racing a POST /api/reload)
+# don't corrupt it.
+_parse_cache: dict[str, tuple[int, int, str, list[GpsFix]]] = {}
+_cache_lock = threading.Lock()
+
+
 def load_gps_dir(directory: str | Path, record_tz: ZoneInfo) -> list[GpsFix]:
-    """Parse every .dat file in a directory and return one combined, time-sorted list."""
+    """
+    Parse every .dat file in a directory and return one combined, time-sorted
+    list. Files unchanged since the previous call (same mtime, size, timezone)
+    are served from cache instead of being re-parsed; entries for files that
+    have since disappeared are dropped.
+    """
     directory = Path(directory)
+    tz_key = str(record_tz)
     all_fixes: list[GpsFix] = []
-    for dat_path in sorted(directory.glob("*.dat")):
-        all_fixes.extend(parse_gps_log(dat_path, record_tz))
+
+    with _cache_lock:
+        present: set[str] = set()
+        for dat_path in sorted(directory.glob("*.dat")):
+            key = str(dat_path.resolve())
+            present.add(key)
+            try:
+                st = dat_path.stat()
+            except OSError:
+                continue  # vanished between glob and stat
+            sig = (st.st_mtime_ns, st.st_size, tz_key)
+            cached = _parse_cache.get(key)
+            if cached and cached[:3] == sig:
+                all_fixes.extend(cached[3])
+            else:
+                fixes = parse_gps_log(dat_path, record_tz)
+                _parse_cache[key] = (*sig, fixes)
+                all_fixes.extend(fixes)
+        for gone in _parse_cache.keys() - present:
+            del _parse_cache[gone]
+
     all_fixes.sort(key=lambda f: f.timestamp)
     return all_fixes
 

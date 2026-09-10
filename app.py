@@ -17,6 +17,7 @@ import argparse
 import os
 import sys
 import threading
+import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,13 +27,18 @@ from flask import Flask, abort, jsonify, render_template, request, send_from_dir
 
 import auth
 import config
+import gps_parser
 import video_transcode
 from gps_parser import load_gps_dir
 from video_matcher import scan_video_dir, find_segments_for_timestamp
 
 app = Flask(__name__)
 
-# Populated at startup by main()
+# The parsed-data snapshot every request reads. Rebuilt by reload_state() and
+# swapped in with a single assignment (atomic in CPython) - a request sees either
+# the whole old snapshot or the whole new one, never a mix, so no read lock is
+# needed. Routes must always index STATE fresh (STATE["fixes"]), never capture a
+# reference across the swap. Populated once at startup by _install_state().
 STATE = {
     "fixes": [],
     "video_segments": [],
@@ -40,7 +46,15 @@ STATE = {
     "display_tz": None,
     "segments_by_channel": {},   # channel -> that channel's segments, time-sorted
     "segment_by_filename": {},   # e.g. "20260904_182500_00002_N_A.MP4" -> VideoSegment
+    "loaded_at": None,
+    "_data_dir": None,           # kept so reload_state() can rebuild with the same config
+    "_record_tz": None,
 }
+
+# Serializes rebuilds so the periodic re-scan and the trigger-file re-scan can't
+# run load_gps_dir()/scan_video_dir() over each other.
+_reload_lock = threading.Lock()
+_rescan_thread_started = False
 
 
 def _local_date(dt_utc, tz) -> str:
@@ -62,7 +76,8 @@ def healthz():
     return (
         jsonify({"status": "ok" if ready else "loading",
                  "fixes": len(STATE["fixes"]),
-                 "segments": len(STATE["video_segments"])}),
+                 "segments": len(STATE["video_segments"]),
+                 "loaded_at": STATE["loaded_at"].isoformat() if STATE["loaded_at"] else None}),
         200 if ready else 503,
     )
 
@@ -281,36 +296,154 @@ def _env_bool(name: str, default: bool) -> bool:
     return v.strip().lower() in ("1", "true", "yes", "on")
 
 
-def _load_state(data_dir: Path, record_tz: ZoneInfo, display_tz: ZoneInfo) -> None:
+def _build_state(data_dir: Path, record_tz: ZoneInfo, display_tz: ZoneInfo) -> dict:
     """
-    Parse the GPS logs and scan the video dir under `data_dir`, populating the
-    module-level STATE dict. Called once at startup - by main() for the CLI /
-    dev server, and by create_app() for a WSGI server. There is no reload
-    endpoint; changing the data dir's contents means restarting the process.
+    Parse the GPS logs and scan the video dir under `data_dir` and return a
+    fresh STATE dict. Pure - touches no globals - so reload_state() can build a
+    new snapshot without disturbing the one requests are reading. Raises
+    FileNotFoundError if GPS/ or Normal/ is missing.
     """
     gps_dir = data_dir / "GPS"
     video_dir = data_dir / "Normal"
     for required in (gps_dir, video_dir):
         if not required.is_dir():
-            sys.exit(f"Expected directory not found: {required}")
+            raise FileNotFoundError(f"Expected directory not found: {required}")
 
-    STATE["fixes"] = load_gps_dir(gps_dir, record_tz=record_tz)
-    STATE["video_dir"] = str(video_dir)
-    STATE["video_segments"] = scan_video_dir(video_dir, record_tz=record_tz)
-    STATE["display_tz"] = display_tz
+    fixes = load_gps_dir(gps_dir, record_tz=record_tz)
+    segments = scan_video_dir(video_dir, record_tz=record_tz)
 
     by_channel = defaultdict(list)
-    for seg in STATE["video_segments"]:  # already time-sorted, so each per-channel list stays time-sorted too
+    for seg in segments:  # already time-sorted, so each per-channel list stays time-sorted too
         by_channel[seg.channel].append(seg)
-    STATE["segments_by_channel"] = dict(by_channel)
-    STATE["segment_by_filename"] = {seg.path.name: seg for seg in STATE["video_segments"]}
 
-    print(f"Loaded {len(STATE['fixes'])} GPS fixes from {gps_dir}")
-    print(f"Found {len(STATE['video_segments'])} video segments in {video_dir}")
+    return {
+        "fixes": fixes,
+        "video_segments": segments,
+        "video_dir": str(video_dir),
+        "display_tz": display_tz,
+        "segments_by_channel": dict(by_channel),
+        "segment_by_filename": {seg.path.name: seg for seg in segments},
+        "loaded_at": datetime.now(timezone.utc),
+        "_data_dir": data_dir,
+        "_record_tz": record_tz,
+    }
+
+
+def _install_state(data_dir: Path, record_tz: ZoneInfo, display_tz: ZoneInfo) -> None:
+    """Initial load at startup. A missing data dir is fatal here (fail loudly)."""
+    global STATE
+    try:
+        STATE = _build_state(data_dir, record_tz, display_tz)
+    except FileNotFoundError as e:
+        sys.exit(str(e))
+    print(f"Loaded {len(STATE['fixes'])} GPS fixes, {len(STATE['video_segments'])} "
+          f"video segments from {data_dir}")
     print(f"Transcoder: {video_transcode.encoder_summary()}")
     if STATE["fixes"] and not STATE["video_segments"]:
         print("WARNING: no video segments matched - check video_matcher.py's "
               "FILENAME_PATTERN against your actual filenames.")
+
+
+def reload_state() -> dict:
+    """
+    Re-scan the data dir and swap in a fresh STATE snapshot. Serialized by
+    _reload_lock. On any failure the current STATE is left untouched and the
+    exception propagates - the caller decides how to report it. Returns a small
+    summary (counts + deltas vs. the previous snapshot).
+    """
+    global STATE
+    with _reload_lock:
+        prev = STATE
+        new = _build_state(prev["_data_dir"], prev["_record_tz"], prev["display_tz"])
+        STATE = new  # single assignment - readers never see a half-updated snapshot
+        # New footage often lands at the "live edge"; clear the prefetch guard so
+        # the next /video request re-warms neighbours around it.
+        _prefetched_from.clear()
+        summary = {
+            "fixes": len(new["fixes"]),
+            "segments": len(new["video_segments"]),
+            "fixes_added": len(new["fixes"]) - len(prev["fixes"]),
+            "segments_added": len(new["video_segments"]) - len(prev["video_segments"]),
+            "loaded_at": new["loaded_at"].isoformat(),
+        }
+    if summary["fixes_added"] or summary["segments_added"]:
+        print(f"Reload: {summary['fixes']} fixes (+{summary['fixes_added']}), "
+              f"{summary['segments']} segments (+{summary['segments_added']})")
+    return summary
+
+
+# "init" = never checked; "absent" = checked, file wasn't there; int = last mtime_ns.
+_trigger_state: object = "init"
+
+
+def _trigger_fired(trigger_path: str) -> bool:
+    """
+    True when the trigger file has just appeared or its mtime has changed since
+    the last check. The file is only ever read (the data mount is read-only), so
+    the sender just re-uploads / touches it after each batch. A file that
+    already exists at the first check does NOT fire - startup did a full load.
+    """
+    global _trigger_state
+    prev = _trigger_state
+    try:
+        m: int | None = Path(trigger_path).stat().st_mtime_ns
+    except OSError:
+        m = None
+    _trigger_state = "absent" if m is None else m
+
+    if m is None or prev == "init":
+        return False            # gone, or pre-existing at startup
+    if prev == "absent":
+        return True             # the file just appeared
+    return m != prev            # touched again
+
+
+def _rescan_loop(interval_s: float, trigger_path: str | None) -> None:
+    poll = 5.0 if trigger_path else max(interval_s, 30.0)
+    since_reload = 0.0
+    while True:
+        time.sleep(poll)
+        since_reload += poll
+        fire = (trigger_path and _trigger_fired(trigger_path)) or \
+               (interval_s and since_reload >= interval_s)
+        if not fire:
+            continue
+        since_reload = 0.0
+        try:
+            reload_state()
+        except Exception as e:  # keep the loop (and the current STATE) alive
+            print(f"WARNING: re-scan failed, keeping current data: {e}")
+
+
+def start_rescan_thread() -> None:
+    """
+    Start the background re-scan loop. Runs if DASHCAM_RESCAN_INTERVAL > 0 (a
+    timed re-scan, 30 s floor) and/or DASHCAM_RELOAD_TRIGGER is set (a file whose
+    mtime the loop watches - the footage-sync side touches it after a batch, and
+    it needs no open port). Idempotent. Must run in the request-serving process
+    (the gunicorn worker via post_fork, not the preload master whose STATE the
+    worker only copies).
+    """
+    global _rescan_thread_started
+    if _rescan_thread_started:
+        return
+    try:
+        interval = max(float(os.environ.get("DASHCAM_RESCAN_INTERVAL", "0")), 0.0)
+    except ValueError:
+        interval = 0.0
+    if interval:
+        interval = max(interval, 30.0)  # floor - don't hammer the disk
+    trigger = os.environ.get("DASHCAM_RELOAD_TRIGGER") or None
+    if not interval and not trigger:
+        return
+    _rescan_thread_started = True
+    threading.Thread(target=_rescan_loop, args=(interval, trigger), daemon=True).start()
+    bits = []
+    if interval:
+        bits.append(f"every {interval:g}s")
+    if trigger:
+        bits.append(f"on {trigger} change")
+    print(f"Background re-scan: {', '.join(bits)}")
 
 
 def create_app():
@@ -326,7 +459,10 @@ def create_app():
     record_tz = ZoneInfo(os.environ.get("DASHCAM_RECORD_TZ", "America/Chicago"))
     display_raw = os.environ.get("DASHCAM_DISPLAY_TZ")
     display_tz = ZoneInfo(display_raw) if display_raw else record_tz
-    _load_state(data_dir, record_tz, display_tz)
+    _install_state(data_dir, record_tz, display_tz)
+    # NB: the re-scan thread is started from gunicorn.conf.py's post_fork (in the
+    # worker), not here - this runs in the preload master, whose STATE the worker
+    # only inherits a copy of.
 
     # Secure cookies by default here - a deployment is behind TLS (nginx). Set
     # DASHCAM_SECURE_COOKIE=0 only if you're knowingly serving plain HTTP.
@@ -392,7 +528,8 @@ def main():
     data_dir = Path(resolve_data_dir(args.data_dir))
     record_tz = ZoneInfo(args.record_timezone)
     display_tz = ZoneInfo(args.display_timezone) if args.display_timezone else record_tz
-    _load_state(data_dir, record_tz, display_tz)
+    _install_state(data_dir, record_tz, display_tz)
+    start_rescan_thread()  # no fork here, so start it directly
 
     # Dev / single-user path. Auth still applies if users exist, but insecure
     # cookies by default so login works over plain-HTTP localhost. threaded=True

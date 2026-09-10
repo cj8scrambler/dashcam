@@ -97,6 +97,42 @@ Session cookies are marked `Secure` (HTTPS only) by default. If you ever reach
 the container directly over plain HTTP instead of through the TLS proxy, set
 `DASHCAM_SECURE_COOKIE=0` or login will appear to do nothing.
 
+### Picking up new footage without a restart
+
+The data directory is parsed once at startup. When footage is synced in while
+the container runs, the app re-scans without a restart, two ways (both active by
+default, use either or both):
+
+- **Timed:** `DASHCAM_RESCAN_INTERVAL` (seconds, default 300) — a background
+  thread re-scans that often. `0` disables it. Re-parsing is incremental, so it
+  stays cheap as GPS history grows.
+- **Trigger file:** `DASHCAM_RELOAD_TRIGGER` (default `/data/.reload`) — the same
+  thread watches this file; create/touch it and the app re-scans within ~5 s.
+  The offload daemon writes it over SFTP into the shared volume after each batch
+  (no port needs to be reachable from its side); you can also
+  `touch <data dir>/.reload` on the host to force a re-scan.
+
+A failed re-scan (e.g. the mount dropped mid-sync) is a no-op — the running data
+is kept.
+
+### Remote footage offload (the `sftp` service)
+
+The compose file includes an `atmoz/sftp` container as a drop point for a
+machine near the car that pulls footage off the camera over WiFi. It writes into
+the **same** directory the viewer reads (`rw` for SFTP, `ro` for the viewer).
+
+One-time setup (see `.env.example` for the exact commands):
+
+1. `SFTP_BIND=<docker-host private IP>:2222` in `.env` — a private VLAN/VPN
+   address, never `0.0.0.0`.
+2. Generate SSH host keys into `./config/sftp/`, drop the offload machine's
+   **public** key into `./config/sftp/keys/`, `chown -R 1000:1000 ./config/sftp`.
+3. `docker compose up -d`.
+
+The offload daemon then, per batch: SFTP each file to a temp name and `rename`
+it into place (atomic), then upload a small file to `dashcam/.reload` to trip
+the trigger. Footage appears in the viewer seconds later.
+
 ### GPU transcoding (optional)
 
 By default clips are transcoded with software `libx264` (~1 min for a cold

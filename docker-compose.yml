@@ -10,6 +10,9 @@
 #   docker compose down            # stop (keeps the transcode cache and logins)
 #   docker compose down -v         # also wipe the transcode cache (logins are a
 #                                  # host bind mount, so they survive this)
+#
+# Two services: `dashcam-viewer` (the web app) and `sftp` (drop point for the
+# remote offload daemon). Both share one .env in this directory.
 
 services:
   dashcam-viewer:
@@ -40,6 +43,12 @@ services:
       DASHCAM_HWACCEL: "${DASHCAM_HWACCEL:-none}"
       DASHCAM_HWACCEL_CONCURRENCY: "${DASHCAM_HWACCEL_CONCURRENCY:-3}"
       # NVIDIA_DRIVER_CAPABILITIES: "compute,video,utility"   # needed for nvenc
+      # Pick up newly-synced footage without a restart:
+      #  - RESCAN_INTERVAL: seconds between background re-scans (0 = off, 30s floor)
+      #  - RELOAD_TRIGGER: a file whose mtime the app watches; the sftp uploader
+      #    touches it after a batch, so the app re-scans within ~5s
+      DASHCAM_RESCAN_INTERVAL: "${DASHCAM_RESCAN_INTERVAL:-300}"
+      DASHCAM_RELOAD_TRIGGER: "${DASHCAM_RELOAD_TRIGGER:-/data/.reload}"
 
     volumes:
       # The SD card / copy of it, containing Normal/ and GPS/. Read-only.
@@ -69,6 +78,32 @@ services:
     #         - driver: nvidia
     #           count: 1
     #           capabilities: [gpu]
+
+  # SFTP drop point for the remote offload daemon (the machine near the car that
+  # pulls footage off the camera). It writes into the SAME host directory the
+  # viewer reads - the viewer keeps that mount read-only, this one has it rw.
+  # Key-only auth, chrooted to /home/offload, no shell. See .env.example for the
+  # one-time host-key + authorized-key setup.
+  sftp:
+    image: atmoz/sftp:alpine
+    container_name: dashcam-sftp
+    restart: unless-stopped
+
+    # Bind to the private VLAN interface only - never 0.0.0.0.
+    ports:
+      - "${SFTP_BIND:?set SFTP_BIND in .env, e.g. 192.168.96.70:2222}:22"
+
+    # user:pass:uid:gid  -- empty pass = key-only. uid/gid must match the owner
+    # of DASHCAM_DATA_PATH on the host (1000 here) so the viewer can read uploads.
+    command: "offload::1000:1000"
+
+    volumes:
+      - "${DASHCAM_DATA_PATH:?}:/home/offload/dashcam"
+      # the offload daemon's PUBLIC key(s) - atmoz builds authorized_keys from this dir
+      - "${DASHCAM_CONFIG_PATH:?}/sftp/keys:/home/offload/.ssh/keys:ro"
+      # persist SSH host keys so the daemon doesn't get host-key-changed warnings
+      - "${DASHCAM_CONFIG_PATH:?}/sftp/ssh_host_ed25519_key:/etc/ssh/ssh_host_ed25519_key"
+      - "${DASHCAM_CONFIG_PATH:?}/sftp/ssh_host_rsa_key:/etc/ssh/ssh_host_rsa_key"
 
 volumes:
   dashcam-cache:
