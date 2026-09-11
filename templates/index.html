@@ -105,6 +105,17 @@
     #layout.theater .video-block.channel-rear { grid-area: rear; }
     #layout.theater .video-block.channel-interior { grid-area: interior; }
     #layout.theater #map-pane { grid-area: map; }
+    /*
+     * <video> otherwise only has width:100% set (see the base `video` rule) and
+     * renders at its natural aspect-ratio height - fine in the sidebar, where
+     * .video-block just grows to match. In theater mode .video-block is
+     * stretched to fill a fixed-size grid cell instead, and if the cell's
+     * aspect ratio is more square than the footage, the video renders taller
+     * than the cell and .video-block's `overflow: hidden` clips the bottom -
+     * which is exactly where the native play/pause/scrubber controls live.
+     * Fill the cell exactly and letterbox instead of overflowing.
+     */
+    #layout.theater .video-block video { width: 100%; height: 100%; object-fit: contain; }
   </style>
 </head>
 <body>
