@@ -219,9 +219,14 @@ def _run_transcode(src: Path, tmp_dest: Path, dest: Path, total_s: float, *, gpu
     """
     One ffmpeg pass into tmp_dest. Streams progress into _progress[dest] as it
     runs; raises RuntimeError if ffmpeg fails or the output is truncated/corrupt.
-    The caller renames tmp_dest -> dest on success.
+    The caller renames tmp_dest -> dest on success. Logs one line per successful
+    transcode naming the encoder actually used - the startup "Transcoder:" line
+    only says what's configured/probed, not what ran for a given file, and a
+    silent per-file GPU->software fallback would otherwise be invisible unless
+    it happened to fail loudly.
     """
-    _progress[dest] = {"total_s": total_s, "current_s": 0.0, "started_at": time.monotonic()}
+    started_at = time.monotonic()
+    _progress[dest] = {"total_s": total_s, "current_s": 0.0, "started_at": started_at}
     label = "nvenc" if gpu else "libx264"
     limiter = _nvenc_sem if gpu else nullcontext()
     try:
@@ -254,6 +259,10 @@ def _run_transcode(src: Path, tmp_dest: Path, dest: Path, total_s: float, *, gpu
                 f"ffmpeg ({label}) produced an incomplete file for {src}: "
                 f"{out_s}s of {total_s}s source - read error on the source media?"
             )
+
+        elapsed = time.monotonic() - started_at
+        speed = f"{total_s / elapsed:.1f}x realtime" if elapsed > 0 else "?"
+        print(f"Transcoded {src.name} with {label} in {elapsed:.1f}s ({speed})")
     finally:
         _progress.pop(dest, None)
 

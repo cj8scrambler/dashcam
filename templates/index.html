@@ -71,25 +71,40 @@
     #follow-toggle.active { color: #fff; border-color: #2b6cff; background: #2b6cff; }
 
     /*
-     * Theater mode is a 2x2 grid: map + up to 3 video channels as siblings.
+     * Theater mode is a 2x2 grid with FIXED corners regardless of which
+     * channels are actually present that day: front top-left, rear top-right,
+     * interior bottom-left, map bottom-right - via named grid-template-areas,
+     * not `order`. `order` only sorts items that exist, so if a channel is
+     * missing the remaining ones slide into the next free cell instead of
+     * leaving its corner blank; grid-area pins each one to its own cell no
+     * matter what else is present.
+     *
      * #side and #videos use display:contents so their children (the map's
      * existing siblings don't move - #side/#videos boxes just disappear for
      * layout purposes) become direct grid items of #layout, without any DOM
-     * restructuring in JS. Cell placement is by `order` (not DOM position):
-     * front top-left, interior top-right, rear bottom-left, map bottom-right.
+     * restructuring in JS. Every #side child that ISN'T one of the four named
+     * cells must be display:none in theater mode, or display:contents
+     * exposes it as a *5th* grid item with no grid-area - which silently
+     * pushes all four real items into an extra implicit row (this broke the
+     * whole layout, including the map, when #signout was added).
      */
-    #layout.theater { display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; gap: 6px; background: #000; }
+    #layout.theater {
+      display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr;
+      grid-template-areas: "front rear" "interior map";
+      gap: 6px; background: #000;
+    }
     #layout.theater #calendar,
-    #layout.theater #info { display: none; }
+    #layout.theater #info,
+    #layout.theater #signout { display: none; }
     #layout.theater #side,
     #layout.theater #videos { display: contents; }
     #layout.theater #map-pane,
     #layout.theater .video-block { min-width: 0; min-height: 0; }
     #layout.theater #theater-exit { display: block; }
-    #layout.theater .video-block.channel-front { order: 1; }
-    #layout.theater .video-block.channel-interior { order: 2; }
-    #layout.theater .video-block.channel-rear { order: 3; }
-    #layout.theater #map-pane { order: 4; }
+    #layout.theater .video-block.channel-front { grid-area: front; }
+    #layout.theater .video-block.channel-rear { grid-area: rear; }
+    #layout.theater .video-block.channel-interior { grid-area: interior; }
+    #layout.theater #map-pane { grid-area: map; }
   </style>
 </head>
 <body>
