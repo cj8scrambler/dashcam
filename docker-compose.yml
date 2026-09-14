@@ -74,6 +74,10 @@ services:
       #    touches it after a batch, so the app re-scans within ~5s
       DASHCAM_RESCAN_INTERVAL: "${DASHCAM_RESCAN_INTERVAL:-300}"
       DASHCAM_RELOAD_TRIGGER: "${DASHCAM_RELOAD_TRIGGER:-/data/.reload}"
+      # "Stops" (map marker + sidebar list for spans with no vehicle movement):
+      # minimum duration under MAX_SPEED to count as a stop, not a red light.
+      DASHCAM_STOP_MIN_MINUTES: "${DASHCAM_STOP_MIN_MINUTES:-5}"
+      DASHCAM_STOP_MAX_SPEED_MPH: "${DASHCAM_STOP_MAX_SPEED_MPH:-2}"
 
     volumes:
       # The SD card / copy of it, containing Normal/ and GPS/. Read-only.

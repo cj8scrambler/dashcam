@@ -14,6 +14,7 @@ Then open http://localhost:5000 in a browser.
 from __future__ import annotations
 
 import argparse
+import bisect
 import os
 import sys
 import threading
@@ -43,9 +44,10 @@ STATE = {
     "fixes": [],
     "video_segments": [],
     "video_dir": None,
+    "parking_segments": [],      # Parking-mode Timelapse ("T") segments, [] if Parking/ absent
     "display_tz": None,
-    "segments_by_channel": {},   # channel -> that channel's segments, time-sorted
-    "segment_by_filename": {},   # e.g. "20260904_182500_00002_N_A.MP4" -> VideoSegment
+    "segments_by_channel": {},   # channel -> that channel's Normal segments, time-sorted
+    "segment_by_filename": {},   # e.g. "20260904_182500_00002_N_A.MP4" -> VideoSegment; both Normal + Parking
     "loaded_at": None,
     "_data_dir": None,           # kept so reload_state() can rebuild with the same config
     "_record_tz": None,
@@ -126,12 +128,197 @@ def api_track():
     return jsonify(points)
 
 
+def _stop_min_duration_s() -> float:
+    try:
+        minutes = float(os.environ.get("DASHCAM_STOP_MIN_MINUTES", "5"))
+    except ValueError:
+        minutes = 5.0
+    return max(minutes, 0.0) * 60.0
+
+
+def _stop_max_speed_mph() -> float:
+    try:
+        mph = float(os.environ.get("DASHCAM_STOP_MAX_SPEED_MPH", "2"))
+    except ValueError:
+        mph = 2.0
+    return max(mph, 0.0)
+
+
+def _detect_stationary_stops(fixes, min_duration_s: float, max_speed_mph: float):
+    """
+    Find runs of consecutive fixes (from a time-sorted list) whose speed never
+    exceeds max_speed_mph, sustained for at least min_duration_s - e.g. a
+    stoplight shouldn't turn into a "stop" entry, a 20-minute errand should.
+    Returns [(start_fix, end_fix), ...], the first and last fix of each
+    qualifying run. A GPS data gap inside an otherwise-stationary run doesn't
+    split it - only a fix that actually reports speed above the threshold
+    does; the vehicle presumably didn't move just because reception briefly
+    dropped while parked.
+    """
+    stops = []
+    run_start = None
+    prev = None
+    for fx in fixes:
+        if fx.speed_mph <= max_speed_mph:
+            if run_start is None:
+                run_start = fx
+            prev = fx
+            continue
+        if run_start is not None and (prev.timestamp - run_start.timestamp).total_seconds() >= min_duration_s:
+            stops.append((run_start, prev))
+        run_start = None
+        prev = fx
+    if run_start is not None and (prev.timestamp - run_start.timestamp).total_seconds() >= min_duration_s:
+        stops.append((run_start, prev))
+    return stops
+
+
+def _last_fix_at_or_before(ts):
+    """
+    Binary search STATE["fixes"] (time-sorted, checked globally rather than
+    just the requested day - the relevant fix may be from earlier, even a
+    prior day) for the last real GPS fix at or before `ts`. Used to backfill a
+    location for a Parking-mode stop, whose own time window may have no GPS
+    coverage at all (the vehicle can be fully powered down while parked) -
+    since the vehicle doesn't move during a stop, its last known position
+    beforehand is still accurate.
+    """
+    fixes = STATE["fixes"]
+    idx = bisect.bisect_right(fixes, ts, key=lambda fx: fx.timestamp) - 1
+    return fixes[idx] if idx >= 0 else None
+
+
+def _stop_json(start_utc, end_utc, lat, lon, tz, *, video_start_utc=None) -> dict:
+    d = {
+        "start": start_utc.isoformat(),
+        "start_local": start_utc.astimezone(tz).isoformat(),
+        "end": end_utc.isoformat(),
+        "end_local": end_utc.astimezone(tz).isoformat(),
+        "lat": lat,
+        "lon": lon,
+        "duration_s": (end_utc - start_utc).total_seconds(),
+    }
+    # Only present when it differs from `start` - see _first_parking_start_within.
+    if video_start_utc is not None and video_start_utc != start_utc:
+        d["video_start"] = video_start_utc.isoformat()
+        d["video_start_local"] = video_start_utc.astimezone(tz).isoformat()
+    return d
+
+
+def _first_parking_start_within(start_utc, end_utc):
+    """
+    Earliest Parking/Timelapse segment start time within [start_utc, end_utc)
+    across any channel, or None if no Parking segment starts in that window.
+
+    Used to pick a better "jump to this video" instant for a GPS-detected stop
+    than its literal start: the GPS fix that first crosses the stationary-speed
+    threshold is commonly still covered by the tail of the last Normal
+    (driving) segment - Normal loop-recording windows run a few minutes past
+    the instant you actually stop - so clicking a long parked stop would
+    otherwise open a few seconds of you still pulling in, not any parked
+    footage. Confirmed against real data (2026-09-08): the stop's GPS-detected
+    start was ~09:33:30, still inside the last Normal segment's 09:31:54-
+    09:36:54 coverage, with the first Parking clip not starting until 09:37:42.
+    Parking-derived stops (built directly from a parking_segments window, not
+    this GPS path) don't need this - they already start exactly at their own
+    segment's start_time.
+    """
+    candidates = [
+        seg.start_time for seg in STATE["parking_segments"]
+        if start_utc <= seg.start_time < end_utc
+    ]
+    return min(candidates) if candidates else None
+
+
+def _overlaps_any(start, end, intervals) -> bool:
+    return any(start < iv_end and end > iv_start for iv_start, iv_end in intervals)
+
+
+@app.route("/api/stops")
+def api_stops():
+    """
+    Return "stops" - spans of no vehicle movement, regardless of source - for
+    ?date=YYYY-MM-DD (interpreted in the display timezone; omitted returns
+    every day's, matching /api/track's convention). Two sources:
+
+      - GPS-detected stationary intervals within ordinary Normal-mode driving
+        (DASHCAM_STOP_MIN_MINUTES / DASHCAM_STOP_MAX_SPEED_MPH thresholds). A
+        GPS-detected stop also carries video_start/video_start_local when a
+        Parking clip starts partway through it - see
+        _first_parking_start_within - so the frontend can click into actual
+        parked footage instead of the tail of the driving clip that happens
+        to still cover the stop's literal (GPS-threshold-crossing) start.
+      - Parking-mode Timelapse clips (STATE["parking_segments"]), whose
+        location is backfilled from the last real GPS fix before the clip.
+
+    A Parking clip whose window falls inside a GPS-detected stop is dropped
+    rather than listed as its own entry: confirmed against real data
+    (2026-09-08) that when the camera's GPS stays powered/logging throughout
+    a long parked stretch (no per-clip GPS gap), the GPS-detected stop already
+    spans the whole thing as one entry, and its video_start (above) plus the
+    stop-scrubber's smart-seek can already reach any instant in that span -
+    including every individual Parking clip - so listing each ~3-minute clip
+    as its own additional stop is pure duplication (this was the actual bug
+    report: dozens of "3 minute" entries repeating right under one long one
+    covering the same hours). A Parking clip with NO covering GPS-detected
+    stop - e.g. GPS genuinely lost the fix during that clip, so there's no
+    stationary run to represent it - is still listed on its own; that's not
+    duplication, it's the only entry for that span.
+
+    Every stop is returned even if no video actually covers it (a real
+    recording gap, or footage that hasn't synced from the camera yet - this
+    app can't tell those apart) - clicking it just gets the same "no video
+    found" result /api/videos already gives today; this is also how a gap
+    gets *noticed* rather than stumbled onto by chance.
+    """
+    tz = STATE["display_tz"]
+    date_raw = request.args.get("date")
+
+    fixes = STATE["fixes"]
+    if date_raw:
+        fixes = [fx for fx in fixes if _local_date(fx.timestamp, tz) == date_raw]
+
+    detected = _detect_stationary_stops(fixes, _stop_min_duration_s(), _stop_max_speed_mph())
+    gps_intervals = [(start_fx.timestamp, end_fx.timestamp) for start_fx, end_fx in detected]
+    stops = [
+        _stop_json(
+            start_fx.timestamp, end_fx.timestamp, start_fx.lat, start_fx.lon, tz,
+            video_start_utc=_first_parking_start_within(start_fx.timestamp, end_fx.timestamp),
+        )
+        for start_fx, end_fx in detected
+    ]
+
+    # A Timelapse "chunk" is usually 2-3 files (one per channel) sharing the
+    # same (start_time, coverage_end) - one stop entry per window, not one per
+    # channel's file.
+    seen_windows = set()
+    for seg in STATE["parking_segments"]:
+        if date_raw and _local_date(seg.start_time, tz) != date_raw:
+            continue
+        window = (seg.start_time, seg.coverage_end())
+        if window in seen_windows:
+            continue
+        seen_windows.add(window)
+        if _overlaps_any(*window, gps_intervals):
+            continue  # already represented by the GPS-detected stop covering this span
+        loc_fix = _last_fix_at_or_before(seg.start_time)
+        if loc_fix is None:
+            continue  # no GPS history at all yet before this clip - skip rather than guess a location
+        stops.append(_stop_json(seg.start_time, seg.coverage_end(), loc_fix.lat, loc_fix.lon, tz))
+
+    stops.sort(key=lambda s: s["start"])
+    return jsonify(stops)
+
+
 @app.route("/api/videos")
 def api_videos():
     """
     Given ?ts=<ISO timestamp, UTC>, return the video segment(s) covering that
     moment, one per channel, with the seek offset (seconds into the file)
-    needed to land exactly on that timestamp.
+    needed to land exactly on that timestamp. Checks Normal segments first,
+    then Parking/Timelapse for any channel Normal didn't cover - the frontend
+    doesn't need to know or care which source a given moment's footage came
+    from, it's the same click-to-load flow either way.
     """
     ts_raw = request.args.get("ts")
     if not ts_raw:
@@ -144,9 +331,17 @@ def api_videos():
         return jsonify({"error": "invalid ts format, expected ISO 8601"}), 400
 
     matches = find_segments_for_timestamp(STATE["video_segments"], ts)
+    if STATE["parking_segments"]:
+        for channel, seg in find_segments_for_timestamp(STATE["parking_segments"], ts).items():
+            matches.setdefault(channel, seg)  # Normal wins if both somehow cover the same instant
+
     result = {}
     for channel, seg in matches.items():
-        offset = (ts - seg.start_time).total_seconds()
+        # compression_ratio is 1.0 for realtime (Normal) segments, so this is
+        # the same formula as before for them; for Parking/Timelapse it
+        # translates "N real seconds into the segment" into "N * ratio seconds
+        # into the file" - see VideoSegment.compression_ratio.
+        offset = (ts - seg.start_time).total_seconds() * seg.compression_ratio
         result[channel] = {
             "filename": seg.path.name,
             "url": f"/video/{seg.path.name}",
@@ -173,15 +368,22 @@ def api_transcode_progress():
 
 def _resolve_video_path(filename):
     """
-    Resolve filename against STATE["video_dir"] and reject anything that
-    escapes it. Shared by both /video and /original so the traversal check
-    only has to be gotten right in one place.
+    Resolve filename to a path this process itself discovered by directory
+    scanning (STATE["segment_by_filename"], covering both Normal and
+    Parking/Timelapse) - never by reconstructing a path from the
+    attacker-controlled `filename` and merely checking it stays inside some
+    base directory. An unscanned filename is always a 404 regardless of what
+    path-traversal tricks it contains, since scan_video_dir keys this dict by
+    Path.name, which by definition can never itself contain "/" or "..". Also
+    means a video from either directory resolves through the same lookup, no
+    "which base dir is this filename under" logic needed. Shared by /video
+    and /original so this only has to be gotten right in one place. Don't
+    revert to reconstructing a path from `filename` when touching this route.
     """
-    video_dir = Path(STATE["video_dir"]).resolve()
-    src = (video_dir / filename).resolve()
-    if not src.is_relative_to(video_dir) or not src.is_file():
+    seg = STATE["segment_by_filename"].get(filename)
+    if not seg or not seg.path.is_file():
         abort(404)
-    return src
+    return seg.path
 
 
 @app.route("/video/<path:filename>")
@@ -237,6 +439,11 @@ def _prefetch_neighbors(seg):
     transcoded gets warmed, but one whose cached file is corrupt is only
     evicted, not rebuilt - that waits until the file is actually requested for
     playback.
+
+    Only looks at STATE["segments_by_channel"] (Normal). A Parking/Timelapse
+    `seg` isn't a member of that list, so `siblings.index(seg)` below raises
+    ValueError and this is a silent no-op for it - the clip itself still
+    serves fine, it just doesn't get neighbor-prefetch warming.
     """
     if seg.path.name in _prefetched_from:
         return
@@ -298,10 +505,16 @@ def _env_bool(name: str, default: bool) -> bool:
 
 def _build_state(data_dir: Path, record_tz: ZoneInfo, display_tz: ZoneInfo) -> dict:
     """
-    Parse the GPS logs and scan the video dir under `data_dir` and return a
+    Parse the GPS logs and scan the video dirs under `data_dir` and return a
     fresh STATE dict. Pure - touches no globals - so reload_state() can build a
     new snapshot without disturbing the one requests are reading. Raises
     FileNotFoundError if GPS/ or Normal/ is missing.
+
+    Parking/ (Timelapse, mode "T") is scanned too, but optionally - unlike
+    GPS/Normal it's fine for a data dir to have none yet (no hardwired parking
+    power, or an older setup). Kept in a separate segments list from Normal's,
+    per video_matcher's warning that Timelapse's per-session-variable cadence
+    would poison Normal's loop-length median if scanned together.
     """
     gps_dir = data_dir / "GPS"
     video_dir = data_dir / "Normal"
@@ -312,17 +525,31 @@ def _build_state(data_dir: Path, record_tz: ZoneInfo, display_tz: ZoneInfo) -> d
     fixes = load_gps_dir(gps_dir, record_tz=record_tz)
     segments = scan_video_dir(video_dir, record_tz=record_tz)
 
+    parking_dir = data_dir / "Parking"
+    parking_segments = []
+    if parking_dir.is_dir():
+        parking_segments = scan_video_dir(
+            parking_dir, record_tz=record_tz, mode="T",
+            measure_duration=True, extend_to_next=True,
+        )
+
     by_channel = defaultdict(list)
     for seg in segments:  # already time-sorted, so each per-channel list stays time-sorted too
         by_channel[seg.channel].append(seg)
+
+    # Filenames are unique across every recording mode/directory, so one
+    # combined lookup serves both /video and /original regardless of source.
+    segment_by_filename = {seg.path.name: seg for seg in segments}
+    segment_by_filename.update((seg.path.name, seg) for seg in parking_segments)
 
     return {
         "fixes": fixes,
         "video_segments": segments,
         "video_dir": str(video_dir),
+        "parking_segments": parking_segments,
         "display_tz": display_tz,
         "segments_by_channel": dict(by_channel),
-        "segment_by_filename": {seg.path.name: seg for seg in segments},
+        "segment_by_filename": segment_by_filename,
         "loaded_at": datetime.now(timezone.utc),
         "_data_dir": data_dir,
         "_record_tz": record_tz,
@@ -336,8 +563,9 @@ def _install_state(data_dir: Path, record_tz: ZoneInfo, display_tz: ZoneInfo) ->
         STATE = _build_state(data_dir, record_tz, display_tz)
     except FileNotFoundError as e:
         sys.exit(str(e))
+    parking_note = f", {len(STATE['parking_segments'])} parking clips" if STATE["parking_segments"] else ""
     print(f"Loaded {len(STATE['fixes'])} GPS fixes, {len(STATE['video_segments'])} "
-          f"video segments from {data_dir}")
+          f"video segments{parking_note} from {data_dir}")
     print(f"Transcoder: {video_transcode.encoder_summary()}")
     if STATE["fixes"] and not STATE["video_segments"]:
         print("WARNING: no video segments matched - check video_matcher.py's "
