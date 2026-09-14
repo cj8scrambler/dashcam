@@ -279,6 +279,16 @@ def _probe_duration_seconds(src: Path) -> float | None:
         return None
 
 
+def probe_duration_seconds(src: Path) -> float | None:
+    """
+    Public entry point for other modules that need a file's real playable
+    duration without duplicating the ffprobe invocation - currently
+    video_matcher.scan_video_dir(measure_duration=True), which needs it to
+    compute a Parking-mode Timelapse segment's compression_ratio.
+    """
+    return _probe_duration_seconds(src)
+
+
 def _last_video_packet_seconds(path: Path, duration_s: float) -> float | None:
     """
     pts_time of the last decodable video packet in roughly the final 15s of

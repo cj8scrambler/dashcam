@@ -46,6 +46,42 @@
     }
     .video-block.gap video { visibility: hidden; }
     .video-block.gap .video-gap-note { display: flex; }
+    /* "Stops" - spans of no vehicle movement, from GPS-detected stationary
+       periods and Parking/Timelapse clips alike (the sidebar list doesn't
+       care which; see the map-marker styling below for the same point). */
+    #stops { border-bottom: 1px solid #2a2d36; }
+    #stops-header { padding: 8px 10px 4px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: #6b7280; }
+    #stops-list { max-height: 160px; overflow-y: auto; }
+    .stop-row { display: flex; justify-content: space-between; padding: 6px 10px; font-size: 12px; cursor: pointer; color: #c3c8d4; }
+    .stop-row:hover { background: #232838; }
+    .stop-row.active { background: #2b6cff; color: #fff; }
+    .stop-row-duration { color: #9aa2b1; }
+    .stop-row.active .stop-row-duration { color: #dbe4ff; }
+
+    /* Map marker for a stop - a filled square (vs. the route's colored line
+       and the round blue positionMarker dot) so it reads as a distinct kind
+       of thing at a glance. Leaflet's default .leaflet-div-icon box
+       (white bg/border) is overridden with !important since it's loaded
+       from leaflet.css at the same specificity. */
+    .stop-marker-wrap { background: none !important; border: none !important; }
+    .stop-marker-icon {
+      width: 14px; height: 14px; margin: 1px; background: #f59e0b; border: 2px solid #fff;
+      border-radius: 3px; box-shadow: 0 0 4px rgba(0,0,0,0.6);
+    }
+    .stop-marker-wrap.active .stop-marker-icon { background: #2b6cff; }
+
+    /* Scrubber for moving through a stop's time window. Fixed-position and a
+       direct child of <body> (not #side) so it needs no theater-mode grid
+       handling at all - see the long comment above #layout.theater. */
+    #stop-scrubber {
+      position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%); z-index: 40;
+      background: rgba(20,22,28,0.95); border: 1px solid #2a2d36; border-radius: 8px;
+      padding: 8px 16px 10px; width: min(480px, calc(100vw - 32px)); box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+    }
+    #stop-scrubber.hidden { display: none; }
+    #stop-scrubber-label { font-size: 12px; color: #9aa2b1; margin-bottom: 6px; text-align: center; }
+    #stop-scrubber input[type=range] { width: 100%; accent-color: #2b6cff; display: block; }
+
     #info { padding: 10px; border-top: 1px solid #2a2d36; font-size: 13px; color: #c3c8d4; }
     #info b { color: #fff; }
     #signout { padding: 8px 10px; border-top: 1px solid #2a2d36; font-size: 12px; }
@@ -94,6 +130,7 @@
       gap: 6px; background: #000;
     }
     #layout.theater #calendar,
+    #layout.theater #stops,
     #layout.theater #info,
     #layout.theater #signout { display: none; }
     #layout.theater #side,
@@ -138,11 +175,20 @@
         </div>
         <div id="cal-grid"></div>
       </div>
+      <div id="stops">
+        <div id="stops-header">Stops</div>
+        <div id="stops-list"></div>
+      </div>
       <button id="theater-exit">&larr; Back to map</button>
       <div id="videos"><div class="empty-msg">Select a day with data, then click a point on the track.</div></div>
       <div id="info">Select a day on the calendar to load its track.</div>
       {% if auth_enabled %}<div id="signout"><a href="/logout">Sign out</a></div>{% endif %}
     </div>
+  </div>
+
+  <div id="stop-scrubber" class="hidden">
+    <div id="stop-scrubber-label"></div>
+    <input type="range" id="stop-scrubber-range" min="0" max="0" step="1" value="0">
   </div>
 
 <script>
@@ -200,6 +246,204 @@ let trackLayer = L.layerGroup().addTo(map);
 let trackMs = [];        // epoch ms per track point, parallel to `track`, for binary search
 let positionMarker = null;
 let autoFollow = true;
+
+// "Stops" - spans of no vehicle movement (GPS-derived stationary periods and
+// Parking/Timelapse clips alike; the frontend treats both the same, see
+// /api/stops). `stops[i]._marker`/`_row` are set by render*() below and reused
+// across re-renders of the same day's data to keep marker<->list selection in
+// sync without rebuilding everything on every click.
+let stops = [];
+let stopsLayer = L.layerGroup().addTo(map);
+let activeStopIndex = -1;
+
+const STOP_ICON = L.divIcon({ className: 'stop-marker-wrap', html: '<div class="stop-marker-icon"></div>', iconSize: [16, 16] });
+const STOP_ICON_ACTIVE = L.divIcon({ className: 'stop-marker-wrap active', html: '<div class="stop-marker-icon"></div>', iconSize: [16, 16] });
+
+function formatLocalClock(iso) {
+  // iso is a *_local field: an ISO string already rendered in the display
+  // timezone by the backend. Pull the wall-clock digits out with a string
+  // match, exactly like onPointClick's info panel does for point.t_local -
+  // never run it through Date/the browser's own (unrelated) local timezone.
+  const m = iso.match(/T(\d\d):(\d\d)/);
+  if (!m) return iso;
+  let h = Number(m[1]);
+  const period = h >= 12 ? 'PM' : 'AM';
+  h = ((h + 11) % 12) + 1;
+  return `${h}:${m[2]} ${period}`;
+}
+function formatStopRange(stop) {
+  return `${formatLocalClock(stop.start_local)}\u2013${formatLocalClock(stop.end_local)}`;
+}
+function formatDurationS(s) {
+  const mins = Math.round(s / 60);
+  if (mins < 60) return `${mins} min`;
+  const h = Math.floor(mins / 60), m = mins % 60;
+  return m ? `${h}h ${m}m` : `${h}h`;
+}
+
+// The fixed offset between a stop's real (UTC) instant and its printed
+// display-timezone wall clock, derived once from start vs. start_local (per
+// the plan: no per-drag timezone math). Reading the wall-clock digits back
+// out "as if" they were UTC and diffing against the real UTC instant gives an
+// offset that can be reapplied to any other instant within the same stop.
+function stopLocalOffsetMs(stop) {
+  const wallAsUtcMs = Date.parse(stop.start_local.replace(/([+-]\d\d:\d\d|Z)$/, 'Z'));
+  return wallAsUtcMs - Date.parse(stop.start);
+}
+function formatWallClock(absMs, offsetMs) {
+  const d = new Date(absMs + offsetMs);
+  let h = d.getUTCHours();
+  const period = h >= 12 ? 'PM' : 'AM';
+  h = ((h + 11) % 12) + 1;
+  const mm = String(d.getUTCMinutes()).padStart(2, '0');
+  const ss = String(d.getUTCSeconds()).padStart(2, '0');
+  return `${h}:${mm}:${ss} ${period}`;
+}
+// Full *_local-shaped ISO string for an arbitrary instant within a stop -
+// reuses the stop's own offset suffix so the result looks exactly like a
+// backend-provided t_local (onPointClick's info panel expects that shape).
+function localIsoForStop(stop, absMs) {
+  const offsetMs = stopLocalOffsetMs(stop);
+  const datePart = new Date(absMs + offsetMs).toISOString().slice(0, 19);
+  const suffixMatch = stop.start_local.match(/([+-]\d\d:\d\d|Z)$/);
+  return `${datePart}${suffixMatch ? suffixMatch[0] : 'Z'}`;
+}
+
+// The stop (index into `stops`) containing UTC ISO timestamp t, or -1.
+function findStopContaining(t) {
+  const ms = Date.parse(t);
+  for (let i = 0; i < stops.length; i++) {
+    if (ms >= Date.parse(stops[i].start) && ms <= Date.parse(stops[i].end)) return i;
+  }
+  return -1;
+}
+
+function renderStopsList() {
+  const list = document.getElementById('stops-list');
+  const section = document.getElementById('stops');
+  list.innerHTML = '';
+  section.style.display = stops.length === 0 ? 'none' : '';
+  stops.forEach((stop, i) => {
+    const row = document.createElement('div');
+    row.className = 'stop-row' + (i === activeStopIndex ? ' active' : '');
+    row.innerHTML = `<span>${formatStopRange(stop)}</span><span class="stop-row-duration">${formatDurationS(stop.duration_s)}</span>`;
+    row.addEventListener('click', () => selectStop(i));
+    list.appendChild(row);
+    stop._row = row;
+  });
+}
+
+function renderStopMarkers() {
+  stopsLayer.clearLayers();
+  stops.forEach((stop, i) => {
+    const marker = L.marker([stop.lat, stop.lon], { icon: i === activeStopIndex ? STOP_ICON_ACTIVE : STOP_ICON })
+      .addTo(stopsLayer)
+      .bindTooltip(`${formatStopRange(stop)} (${formatDurationS(stop.duration_s)})`, { direction: 'top', offset: [0, -10] });
+    marker.on('click', () => selectStop(i));
+    stop._marker = marker;
+  });
+}
+
+function markActiveStopMarker() {
+  stops.forEach((s, idx) => {
+    if (s._marker) s._marker.setIcon(idx === activeStopIndex ? STOP_ICON_ACTIVE : STOP_ICON);
+  });
+}
+
+function setActiveStop(idx) {
+  if (idx === activeStopIndex) return;
+  activeStopIndex = idx;
+  renderStopsList();
+  markActiveStopMarker();
+  if (idx >= 0 && stops[idx]._row) stops[idx]._row.scrollIntoView({ block: 'nearest' });
+}
+
+// Entry point for both the map marker and the sidebar row - constructs a
+// point shaped like a GpsFix/track point and dispatches through the exact
+// same onPointClick() an ordinary map click uses. No separate video-loading
+// path for stops.
+function selectStop(i, { autoplay = false } = {}) {
+  const stop = stops[i];
+  if (!stop) return;
+  const point = {
+    t: stop.start, t_local: stop.start_local,
+    lat: stop.lat, lon: stop.lon,
+    speed_mph: 0, speed_kmh: 0, alt_m: 0,
+  };
+  onPointClick(point, { autoplay });
+}
+
+const scrubberEl = document.getElementById('stop-scrubber');
+const scrubberRange = document.getElementById('stop-scrubber-range');
+const scrubberLabel = document.getElementById('stop-scrubber-label');
+let scrubberStop = null;   // the stop the scrubber currently spans, or null when hidden
+
+function hideStopScrubber() {
+  scrubberStop = null;
+  scrubberEl.classList.add('hidden');
+}
+
+function updateScrubberLabel() {
+  if (!scrubberStop) return;
+  const absMs = Date.parse(scrubberStop.start) + Number(scrubberRange.value) * 1000;
+  scrubberLabel.textContent =
+    `${formatWallClock(absMs, stopLocalOffsetMs(scrubberStop))} \u2014 stop lasting ${formatDurationS(scrubberStop.duration_s)}`;
+}
+
+// Shown whenever the currently-loaded point falls within a known stop's
+// range - regardless of whether it was reached via the marker, the sidebar
+// list, or an ordinary map click that happens to land inside a stop (see the
+// single call site at the end of onPointClick).
+function showStopScrubberFor(stop, atMs) {
+  scrubberStop = stop;
+  const durationS = Math.max(1, Math.round((Date.parse(stop.end) - Date.parse(stop.start)) / 1000));
+  scrubberRange.max = durationS;
+  scrubberRange.value = Math.max(0, Math.min(durationS, Math.round((atMs - Date.parse(stop.start)) / 1000)));
+  updateScrubberLabel();
+  scrubberEl.classList.remove('hidden');
+}
+
+// Smart seek: if every currently-loaded (non-broken) channel's segment
+// coverage already spans the target instant, just seek the <video> elements
+// directly (no network round trip). Otherwise - only once the drag is
+// released (`commit`), to avoid hammering the transcode pipeline mid-drag -
+// fall back to a full onPointClick reload to find whatever segment actually
+// covers that instant.
+function scrubToInstant(stop, absMs, { commit }) {
+  updatePositionMarker({ lat: stop.lat, lon: stop.lon });
+  const coversAll = activeVideos.length > 0 &&
+    activeVideos.every(a => a.broken || (absMs >= a.startMs && absMs < a.endMs));
+  if (coversAll) {
+    for (const a of activeVideos) {
+      if (a.broken) continue;
+      const dur = a.el.duration || 0;
+      const target = (absMs - a.startMs) / 1000 * (a.ratio || 1);
+      seekMuteUntil = performance.now() + 700;
+      a.el.currentTime = Math.max(0, Math.min(target, dur || target));
+    }
+    document.getElementById('info').innerHTML =
+      `<b>${formatWallClock(absMs, stopLocalOffsetMs(stop))} (stop)</b><br>` +
+      `Lat/Lon: ${stop.lat.toFixed(6)}, ${stop.lon.toFixed(6)}`;
+    return;
+  }
+  if (!commit) return;
+  onPointClick({
+    t: new Date(absMs).toISOString(),
+    t_local: localIsoForStop(stop, absMs),
+    lat: stop.lat, lon: stop.lon,
+    speed_mph: 0, speed_kmh: 0, alt_m: 0,
+  });
+}
+
+scrubberRange.addEventListener('input', () => {
+  if (!scrubberStop) return;
+  updateScrubberLabel();
+  scrubToInstant(scrubberStop, Date.parse(scrubberStop.start) + Number(scrubberRange.value) * 1000, { commit: false });
+});
+scrubberRange.addEventListener('change', () => {
+  if (!scrubberStop) return;
+  scrubToInstant(scrubberStop, Date.parse(scrubberStop.start) + Number(scrubberRange.value) * 1000, { commit: true });
+});
 
 const followToggleEl = document.getElementById('follow-toggle');
 followToggleEl.addEventListener('click', () => {
@@ -321,32 +565,45 @@ async function selectDay(dateStr) {
   selectedDate = dateStr;
   renderCalendar();
 
-  const res = await apiFetch(`/api/track?date=${encodeURIComponent(dateStr)}`);
-  track = await res.json();
+  const [trackRes, stopsRes] = await Promise.all([
+    apiFetch(`/api/track?date=${encodeURIComponent(dateStr)}`),
+    apiFetch(`/api/stops?date=${encodeURIComponent(dateStr)}`),
+  ]);
+  track = await trackRes.json();
   trackMs = track.map(p => Date.parse(p.t));
+  stops = await stopsRes.json();
+  activeStopIndex = -1;
+  hideStopScrubber();
 
   document.getElementById('videos').innerHTML =
     '<div class="empty-msg">Click a point on the track to load nearby video.</div>';
   document.getElementById('info').textContent = `${dateStr} - click the path to inspect a point.`;
 
   trackLayer.clearLayers();
+  renderStopsList();
+  renderStopMarkers();
   if (positionMarker) { map.removeLayer(positionMarker); positionMarker = null; }
-  if (track.length === 0) {
+
+  const bounds = [];
+  if (track.length > 0) {
+    for (let i = 0; i < track.length - 1; i++) {
+      const a = track[i], b = track[i + 1];
+      const avgSpeed = (a.speed_mph + b.speed_mph) / 2;
+      const color = speedColor(avgSpeed);
+      const seg = L.polyline([[a.lat, a.lon], [b.lat, b.lon]], {
+        color, weight: 5, opacity: 0.9
+      }).addTo(trackLayer);
+      seg.on('click', () => onPointClick(a));
+      bounds.push([a.lat, a.lon]);
+    }
+    bounds.push([track[track.length - 1].lat, track[track.length - 1].lon]);
+  }
+  for (const s of stops) bounds.push([s.lat, s.lon]);
+
+  if (bounds.length === 0) {
     document.getElementById('info').textContent = `${dateStr} - no GPS fixes.`;
     return;
   }
-  const bounds = [];
-  for (let i = 0; i < track.length - 1; i++) {
-    const a = track[i], b = track[i + 1];
-    const avgSpeed = (a.speed_mph + b.speed_mph) / 2;
-    const color = speedColor(avgSpeed);
-    const seg = L.polyline([[a.lat, a.lon], [b.lat, b.lon]], {
-      color, weight: 5, opacity: 0.9
-    }).addTo(trackLayer);
-    seg.on('click', () => onPointClick(a));
-    bounds.push([a.lat, a.lon]);
-  }
-  bounds.push([track[track.length - 1].lat, track[track.length - 1].lon]);
   map.fitBounds(bounds, { padding: [30, 30] });
 }
 
@@ -503,6 +760,10 @@ async function onPointClick(point, { autoplay = false } = {}) {
   const channels = CHANNEL_ORDER.filter(c => c in segments);
   if (channels.length === 0) {
     container.innerHTML = '<div class="empty-msg">No video found covering this timestamp.</div>';
+    const stopIdx = findStopContaining(point.t);
+    setActiveStop(stopIdx);
+    if (stopIdx >= 0) showStopScrubberFor(stops[stopIdx], Date.parse(point.t));
+    else hideStopScrubber();
     return;
   }
   for (const channel of channels) {
@@ -526,7 +787,15 @@ async function onPointClick(point, { autoplay = false } = {}) {
     const v = block.querySelector('video');
     v.muted = channel !== 'front';  // only the front camera plays audio; the rest would just echo
     const startMs = Date.parse(seg.start_time);
-    const av = { channel, el: v, startMs, endMs: Date.parse(seg.end_time), broken: false };
+    // (file seconds)/(real seconds) for this segment, back-derived from the
+    // offset the backend already computed (offset_seconds = elapsed_real_s *
+    // compression_ratio - see video_matcher.VideoSegment.compression_ratio).
+    // Lets the stop-scrubber's smart-seek translate a dragged real-world
+    // instant into a video position without a network round trip. Falls back
+    // to 1 (realtime) right at a segment's own start, where elapsed is 0.
+    const elapsedRealS = (Date.parse(point.t) - startMs) / 1000;
+    const ratio = elapsedRealS > 0 ? seg.offset_seconds / elapsedRealS : 1;
+    const av = { channel, el: v, startMs, endMs: Date.parse(seg.end_time), broken: false, ratio };
 
     v.addEventListener('loadedmetadata', () => { v.currentTime = seg.offset_seconds; });
     v.addEventListener('loadeddata', () => {
@@ -575,6 +844,15 @@ async function onPointClick(point, { autoplay = false } = {}) {
     pollTranscodeProgress(status, seg.filename);
   }
   wireSyncedPlayback();
+
+  // Show/hide the stop-scrubber based on whether the point we just loaded
+  // falls inside a known stop - regardless of how we got here (marker,
+  // sidebar row, an ordinary map click landing inside a stop, or the
+  // scrubber itself reloading into a new segment).
+  const stopIdx = findStopContaining(point.t);
+  setActiveStop(stopIdx);
+  if (stopIdx >= 0) showStopScrubberFor(stops[stopIdx], Date.parse(point.t));
+  else hideStopScrubber();
 }
 
 const _progressTimers = new WeakMap();
