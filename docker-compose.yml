@@ -17,8 +17,15 @@
 services:
   dashcam-viewer:
     build: .
-    image: dashcam-viewer
-    container_name: dashcam-viewer
+    # Both default to the pre-existing literal names, so an existing single-
+    # instance deployment's .env needs no changes. Set DASHCAM_IMAGE and
+    # DASHCAM_CONTAINER_NAME in a second instance's .env (e.g. a dev/staging
+    # copy running alongside production on the same host) so `docker compose
+    # build` doesn't overwrite the other instance's image tag and `up` doesn't
+    # collide on container name - both must be unique per Docker daemon
+    # regardless of Compose project name.
+    image: "${DASHCAM_IMAGE:-dashcam-viewer}"
+    container_name: "${DASHCAM_CONTAINER_NAME:-dashcam-viewer}"
     restart: unless-stopped
     networks:
       - app-net
@@ -86,16 +93,34 @@ services:
   # viewer reads - the viewer keeps that mount read-only, this one has it rw.
   # Key-only auth, chrooted to /home/offload, no shell. See .env.example for the
   # one-time host-key + authorized-key setup.
+  #
+  # Only the real offload daemon should ever point at this - a second
+  # (dev/staging) instance shouldn't run its own. Disabled by default via
+  # Compose profiles: this service only starts when the "sftp" profile is
+  # active (`COMPOSE_PROFILES=sftp` in .env, or `--profile sftp` on the CLI) -
+  # a plain `docker compose up`/`up -d` with no profile set skips it entirely,
+  # no need to name dashcam-viewer explicitly. Profiles only gate which
+  # services *start*, though - Compose still interpolates every service's
+  # variables up front regardless, so SFTP_BIND below defaults to a safe
+  # loopback-only bind rather than being required, or a disabled instance's
+  # `docker compose up` would still hard-fail on a missing var it'll never use.
   sftp:
     image: atmoz/sftp:alpine
-    container_name: dashcam-sftp
+    profiles: ["sftp"]
+    # Parameterized for the same container-name-uniqueness reason as
+    # dashcam-viewer, above - relevant if you ever DO want two sftp services.
+    container_name: "${DASHCAM_SFTP_CONTAINER_NAME:-dashcam-sftp}"
     restart: unless-stopped
     networks:
       - app-net
 
-    # Bind to the private VLAN interface only - never 0.0.0.0.
+    # Bind to the private VLAN interface only - never 0.0.0.0. The default
+    # here is loopback-only specifically so an operator who sets
+    # COMPOSE_PROFILES=sftp without also setting SFTP_BIND gets "unreachable
+    # from the network" rather than "open to the network" - enabling it for
+    # real still requires deliberately setting this to the VLAN address.
     ports:
-      - "${SFTP_BIND:?set SFTP_BIND in .env, e.g. 192.168.96.70:2222}:22"
+      - "${SFTP_BIND:-127.0.0.1:2222}:22"
 
     # user:pass:uid:gid  -- empty pass = key-only. uid/gid must match the owner
     # of DASHCAM_DATA_PATH on the host (1000 here) so the viewer can read uploads.
