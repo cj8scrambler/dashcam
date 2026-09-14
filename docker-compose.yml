@@ -14,6 +14,22 @@
 # Two services: `dashcam-viewer` (the web app) and `sftp` (drop point for the
 # remote offload daemon). Both share one .env in this directory.
 
+# Pinned explicitly rather than left to default to the compose-file
+# directory's basename. `docker compose down` is NOT profile-filtered the
+# way `up` is - it matches and removes every container under the resolved
+# PROJECT NAME regardless of which profile (if any) is active in that
+# invocation (confirmed directly: `down` with no profile active still
+# removed a container that was only ever started under one). Two checkouts
+# of this repo whose directories happen to share a basename (or where a
+# second instance's .env doesn't override this) would silently resolve to
+# the SAME project name - so a `docker compose down` run against a "disabled"
+# dev instance would tear down a live production instance's containers,
+# `sftp` included, without any error or warning. A second instance's .env
+# MUST set COMPOSE_PROJECT_NAME to something else, e.g. dashcam-dev - see
+# .env.example. (For THIS repo's existing single-instance deployment the
+# directory is already named `dashcam`, so this default changes nothing.)
+name: "${COMPOSE_PROJECT_NAME:-dashcam}"
+
 services:
   dashcam-viewer:
     build: .
