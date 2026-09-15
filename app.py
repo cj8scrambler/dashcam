@@ -20,7 +20,7 @@ import sys
 import threading
 import time
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -61,6 +61,30 @@ _rescan_thread_started = False
 
 def _local_date(dt_utc, tz) -> str:
     return dt_utc.astimezone(tz).date().isoformat()
+
+
+def _day_bounds_utc(date_str: str, tz) -> tuple[datetime, datetime]:
+    """
+    UTC [start, end) for one display-timezone calendar day, e.g. "2026-09-10" in
+    America/Chicago -> that day's local midnight through the next one, converted
+    to UTC (width varies across a DST transition).
+
+    Unlike _local_date() above - a POINT test used by /api/track and /api/stops
+    for GPS fixes and stop endpoints - a VideoSegment's coverage window is a
+    SPAN. Filtering spans by _local_date(seg.start_time) alone would wrongly
+    drop a segment that starts just before local midnight but covers into the
+    target day. Used by /api/coverage, which tests span overlap instead.
+
+    Raises ValueError on a malformed date_str (unlike /api/track's and
+    /api/stops's date param, which is never parsed, only string-compared, so
+    garbage there just silently matches nothing) - the caller turns this into
+    a 400, since this endpoint actually has to parse it to compute bounds.
+    """
+    y, m, d = (int(p) for p in date_str.split("-"))
+    local_midnight = datetime(y, m, d, tzinfo=tz)
+    start = local_midnight.astimezone(timezone.utc)
+    end = (local_midnight + timedelta(days=1)).astimezone(timezone.utc)
+    return start, end
 
 
 @app.route("/")
@@ -234,6 +258,29 @@ def _overlaps_any(start, end, intervals) -> bool:
     return any(start < iv_end and end > iv_start for iv_start, iv_end in intervals)
 
 
+def _merge_coverage_intervals(intervals):
+    """
+    Standard sweep-line interval merge: given [(start, end), ...] (unsorted,
+    possibly overlapping), return a sorted, non-overlapping, non-adjacent list.
+    Used by /api/coverage to collapse per-segment (start_time, coverage_end())
+    windows - every channel, both Normal and Parking/Timelapse - into "is there
+    ANY footage covering this instant". Permissive across channels: a single
+    covered channel counts as covered - this answers "where are the gaps", not
+    "which channels are present".
+    """
+    if not intervals:
+        return []
+    ordered = sorted(intervals, key=lambda iv: iv[0])
+    merged = [list(ordered[0])]
+    for start, end in ordered[1:]:
+        if start <= merged[-1][1]:
+            if end > merged[-1][1]:
+                merged[-1][1] = end
+        else:
+            merged.append([start, end])
+    return merged
+
+
 @app.route("/api/stops")
 def api_stops():
     """
@@ -308,6 +355,41 @@ def api_stops():
 
     stops.sort(key=lambda s: s["start"])
     return jsonify(stops)
+
+
+@app.route("/api/coverage")
+def api_coverage():
+    """
+    Return merged video-coverage intervals for ?date=YYYY-MM-DD (interpreted in
+    the display timezone, same convention as /api/track and /api/stops) - used
+    by the map to dash/fade the speed-colored track wherever footage is
+    missing, without the frontend ever creating a <video> element (which would
+    trigger a real transcode) just to find out.
+
+    Merges (start_time, coverage_end()) windows from STATE["video_segments"]
+    (Normal) and STATE["parking_segments"] (Parking/Timelapse), any channel
+    counts as covered. Pure metadata; never touches video_transcode. Unlike
+    /api/track's/api/stops's date filter (a point test on each fix's own local
+    date), segments are SPANS, so filtering is by day-window overlap
+    (_day_bounds_utc), not the segment's start_time's local date alone. date
+    must be well-formed if given (400 on a bad value), since this endpoint
+    actually has to parse it to compute day bounds (unlike those two routes).
+
+    Returns [{"start": ..., "end": ...}, ...] (UTC ISO), sorted, non-overlapping.
+    """
+    tz = STATE["display_tz"]
+    date_raw = request.args.get("date")
+    segments = STATE["video_segments"] + STATE["parking_segments"]
+
+    if date_raw:
+        try:
+            day_start, day_end = _day_bounds_utc(date_raw, tz)
+        except ValueError:
+            return jsonify({"error": "invalid date format, expected YYYY-MM-DD"}), 400
+        segments = [s for s in segments if s.start_time < day_end and s.coverage_end() > day_start]
+
+    merged = _merge_coverage_intervals([(s.start_time, s.coverage_end()) for s in segments])
+    return jsonify([{"start": start.isoformat(), "end": end.isoformat()} for start, end in merged])
 
 
 @app.route("/api/videos")

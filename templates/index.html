@@ -171,6 +171,10 @@
         <div>Speed (mph)</div>
         <div class="grad" style="background: linear-gradient(to right, #2b6cff 0%, #22c55e 31.25%, #eab308 62.5%, #ef4444 100%);"></div>
         <div style="display:flex; justify-content:space-between;"><span>0</span><span>80+</span></div>
+        <div style="margin-top:6px; display:flex; align-items:center; gap:6px;">
+          <span style="display:inline-block; width:20px; height:0; border-top:2px dashed #000;"></span>
+          <span>No video</span>
+        </div>
       </div>
       <div id="stop-scrubber" class="hidden">
         <div id="stop-scrubber-times">
@@ -254,6 +258,9 @@ L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
 
 let trackLayer = L.layerGroup().addTo(map);
 let trackMs = [];        // epoch ms per track point, parallel to `track`, for binary search
+// Coverage intervals for the selected day: [[startMs, endMs], ...], sorted,
+// non-overlapping (merged server-side - see /api/coverage in app.py).
+let coverageMs = [];
 let positionMarker = null;
 let autoFollow = true;
 
@@ -524,6 +531,20 @@ function findFirstTrackPointAtOrAfter(ms) {
   return track[lo];
 }
 
+// True if `ms` falls inside a covered interval. Binary search for the
+// rightmost interval whose start <= ms (mirror image of
+// findFirstTrackPointAtOrAfter's leftmost-bisect above), then a plain range
+// check against that interval's end.
+function isCovered(ms) {
+  if (coverageMs.length === 0 || ms < coverageMs[0][0]) return false;
+  let lo = 0, hi = coverageMs.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (coverageMs[mid][0] <= ms) lo = mid; else hi = mid - 1;
+  }
+  return ms < coverageMs[lo][1];
+}
+
 async function loadDays() {
   const res = await apiFetch('/api/days');
   const days = await res.json();
@@ -593,13 +614,16 @@ async function selectDay(dateStr) {
   selectedDate = dateStr;
   renderCalendar();
 
-  const [trackRes, stopsRes] = await Promise.all([
+  const [trackRes, stopsRes, coverageRes] = await Promise.all([
     apiFetch(`/api/track?date=${encodeURIComponent(dateStr)}`),
     apiFetch(`/api/stops?date=${encodeURIComponent(dateStr)}`),
+    apiFetch(`/api/coverage?date=${encodeURIComponent(dateStr)}`),
   ]);
   track = await trackRes.json();
   trackMs = track.map(p => Date.parse(p.t));
   stops = await stopsRes.json();
+  const coverage = await coverageRes.json();
+  coverageMs = coverage.map(iv => [Date.parse(iv.start), Date.parse(iv.end)]);
   activeStopIndex = -1;
   hideStopScrubber();
 
@@ -625,6 +649,29 @@ async function selectDay(dateStr) {
       bounds.push([a.lat, a.lon]);
     }
     bounds.push([track[track.length - 1].lat, track[track.length - 1].lon]);
+
+    // No-video overlay: one continuous polyline per contiguous run of
+    // uncovered pairs (not one dash per tiny GPS-fix-pair segment - a first
+    // pass tried that and, confirmed live, the dash pattern restarted on
+    // every ~1s segment and blended into illegibility once zoomed out).
+    // Drawn after the speed line, which is left fully solid/full-opacity
+    // above regardless of coverage - see isCovered()/api_coverage in app.py.
+    // Never creates a <video> element, so this never triggers a transcode.
+    let runStart = -1;
+    for (let i = 0; i < track.length - 1; i++) {
+      const uncovered = !isCovered(trackMs[i]);
+      if (uncovered && runStart === -1) runStart = i;
+      const isLastPair = i === track.length - 2;
+      if ((!uncovered || isLastPair) && runStart !== -1) {
+        const runEnd = (uncovered && isLastPair) ? i : i - 1;
+        const latlngs = track.slice(runStart, runEnd + 2).map(p => [p.lat, p.lon]);
+        const gapLine = L.polyline(latlngs, {
+          color: '#000', weight: 3, opacity: 0.95, dashArray: '4 12',
+        }).addTo(trackLayer);
+        gapLine.on('click', () => onPointClick(track[runStart]));
+        runStart = -1;
+      }
+    }
   }
   for (const s of stops) bounds.push([s.lat, s.lon]);
 
@@ -801,7 +848,7 @@ async function onPointClick(point, { autoplay = false } = {}) {
       const block = document.createElement('div');
       block.className = `video-block channel-${channel} gap`;
       block.innerHTML = `<div class="video-label"><span>${channel}</span></div>
-        <div class="video-gap-note">No video found for this moment &mdash; not a stuck transcode. Could be a genuine recording gap, or footage still waiting to sync from the camera.</div>
+        <div class="video-gap-note">No video found covering this timestamp.</div>
         <video></video>`;
       container.appendChild(block);
     }
