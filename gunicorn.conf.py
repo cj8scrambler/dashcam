@@ -19,7 +19,15 @@ bind = f"{os.environ.get('DASHCAM_HOST', '0.0.0.0')}:{os.environ.get('DASHCAM_PO
 
 workers = 1
 worker_class = "gthread"
-threads = int(os.environ.get("DASHCAM_THREADS", "16"))
+# Higher than it looks like it should need to be, on purpose: video_transcode's
+# TRANSCODE_CONCURRENCY caps actual ffmpeg processes (default 4) separately -
+# most threads here are just *waiting* on that semaphore, not doing CPU work,
+# so they're cheap. Too few threads and a burst of /video requests (scrolling
+# fast through a stop's clips) exhausts the whole pool waiting on that cap,
+# and since workers=1, that starves every OTHER route too (/api/*, even
+# /healthz) - confirmed live 2026-09-15, the whole UI froze under load with
+# the old default of 16.
+threads = int(os.environ.get("DASHCAM_THREADS", "64"))
 
 # A first-view transcode holds its request open for the length of the encode
 # (~1 min for a 5-minute clip, more on a slow host) - far past gunicorn's 30s

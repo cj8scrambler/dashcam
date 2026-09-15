@@ -26,7 +26,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 # "none" -> software libx264; "nvenc" -> NVIDIA GPU. See module docstring.
@@ -50,8 +50,98 @@ SCALE_WIDTH = "1280"  # output width in pixels; height auto-scales to preserve a
 _NVENC_MAX_CONCURRENT = max(1, int(os.environ.get("DASHCAM_HWACCEL_CONCURRENCY", "3")))
 _nvenc_sem = threading.BoundedSemaphore(_NVENC_MAX_CONCURRENT)
 
+# Overall cap across BOTH encoders - unlike _nvenc_sem (a hardware session
+# limit, GPU-only), this bounds total system load: scrubbing/skipping quickly
+# through a stop's many short clips can fire off a burst of on-demand +
+# prefetch transcodes (each a real ffmpeg process) faster than they finish,
+# which is enough concurrent libx264 to bog the whole host down. Extra
+# requests past this cap simply queue for a free slot rather than all
+# launching at once - applied in _run_transcode regardless of gpu, with
+# _nvenc_sem as an additional, stricter sub-limit only when gpu=True.
+TRANSCODE_CONCURRENCY = max(1, int(os.environ.get("DASHCAM_TRANSCODE_CONCURRENCY", "4")))
+_transcode_sem = threading.BoundedSemaphore(TRANSCODE_CONCURRENCY)
+
+# How long a request will wait for a transcode slot before giving up rather
+# than blocking its gunicorn worker thread forever. gunicorn.conf.py's
+# DASHCAM_THREADS is already sized generously so a pile of waiting threads
+# doesn't starve every other route - this is a second, independent safety
+# net so a truly pathological burst still fails fast (a clear 503, see
+# app.py's serve_video) instead of a thread parked indefinitely. Comfortably
+# longer than one typical transcode (~1 min for a 5-minute clip) so a request
+# that would succeed shortly doesn't get rejected just for being 5th in line.
+TRANSCODE_QUEUE_TIMEOUT_S = float(os.environ.get("DASHCAM_TRANSCODE_QUEUE_TIMEOUT", "90"))
+
+
+class TranscodeBusy(RuntimeError):
+    """
+    Raised when no transcode slot (general or, on the gpu path, NVENC-
+    specific) freed up within TRANSCODE_QUEUE_TIMEOUT_S. Public (like
+    TranscodeCancelled below) because app.py's serve_video() catches it
+    specifically, to answer with a quick 503 rather than a generic 500.
+    """
+
+
+@contextmanager
+def _acquire_or_busy(sem: threading.Semaphore, what: str):
+    """Context manager: acquire `sem` within TRANSCODE_QUEUE_TIMEOUT_S or raise TranscodeBusy(what)."""
+    if not sem.acquire(timeout=TRANSCODE_QUEUE_TIMEOUT_S):
+        raise TranscodeBusy(
+            f"no {what} slot freed up within {TRANSCODE_QUEUE_TIMEOUT_S:.0f}s - try again shortly"
+        )
+    try:
+        yield
+    finally:
+        sem.release()
+
+
 _nvenc_state_lock = threading.Lock()
 _nvenc_usable_cached: bool | None = None
+
+# The ffmpeg process for each in-flight transcode, keyed by destination cache
+# path - lets cancel_transcode() actually kill a running job (see there).
+# Populated only once a job has cleared the concurrency semaphore(s) and
+# really started (a merely *queued* job - still waiting on _transcode_sem -
+# has nothing here yet to cancel; it just hasn't cost anything yet either).
+_procs_guard = threading.Lock()
+_active_procs: dict[Path, subprocess.Popen] = {}
+
+# Bumped by cancel_transcode() every time it's called for a dest - even if
+# nothing was actively running - and checked by _run_transcode against a
+# baseline it captures for itself at the very start of each attempt. One
+# mechanism catches cancellation landing during ANY of the three places a
+# transcode can be waiting or running: queued behind another caller's attempt
+# for the SAME file (_lock_for(dest) - checked in ensure_transcoded before
+# even this function is called, to skip the ffprobe/cache-eviction work too),
+# queued for a general TRANSCODE_CONCURRENCY/NVENC slot (checked right below,
+# before Popen), or actually running (checked after proc.wait()). Without
+# this, a caller queued behind a cancelled attempt for the same file - e.g.
+# an on-demand /video request arriving while a prefetch thread already holds
+# the lock - would calmly start a BRAND NEW transcode of a file the user has
+# since navigated away from once its turn came, invisible to a cancel that
+# only looked at _active_procs - confirmed live 2026-09-15: this is what kept
+# starving a segment's genuinely-wanted transcode after the user had already
+# moved on and even cancelled the old one.
+_generation_guard = threading.Lock()
+_cancel_generation: dict[Path, int] = {}
+
+
+def _current_generation(dest: Path) -> int:
+    with _generation_guard:
+        return _cancel_generation.get(dest, 0)
+
+
+def _bump_generation(dest: Path) -> None:
+    with _generation_guard:
+        _cancel_generation[dest] = _cancel_generation.get(dest, 0) + 1
+
+
+class TranscodeCancelled(RuntimeError):
+    """
+    Raised when a transcode was deliberately killed (or never started because
+    it had already been superseded) via cancel_transcode(). Public (like
+    TranscodeBusy) because app.py's serve_video() catches it specifically,
+    to answer with a clear status instead of a generic 500.
+    """
 
 # depend on the filesystem's atime tracking being enabled.
 MAX_CACHE_AGE_DAYS = 14
@@ -181,9 +271,11 @@ def encoder_summary() -> str:
     if HWACCEL == "nvenc":
         if _nvenc_usable():
             return (f"NVIDIA nvenc (h264_nvenc {NVENC_PRESET}/cq{NVENC_CQ}, "
-                    f"≤{_NVENC_MAX_CONCURRENT} concurrent), software libx264 fallback")
-        return "software libx264 (DASHCAM_HWACCEL=nvenc set, but no usable GPU here)"
-    return f"software libx264 ({FFMPEG_PRESET}, crf {FFMPEG_CRF})"
+                    f"≤{_NVENC_MAX_CONCURRENT} concurrent), software libx264 fallback, "
+                    f"≤{TRANSCODE_CONCURRENCY} concurrent overall")
+        return (f"software libx264 (DASHCAM_HWACCEL=nvenc set, but no usable GPU here), "
+                f"≤{TRANSCODE_CONCURRENCY} concurrent")
+    return f"software libx264 ({FFMPEG_PRESET}, crf {FFMPEG_CRF}), ≤{TRANSCODE_CONCURRENCY} concurrent"
 
 
 def _ffmpeg_cmd(src: Path, tmp_dest: Path, *, gpu: bool) -> list[str]:
@@ -218,19 +310,37 @@ def _ffmpeg_cmd(src: Path, tmp_dest: Path, *, gpu: bool) -> list[str]:
 def _run_transcode(src: Path, tmp_dest: Path, dest: Path, total_s: float, *, gpu: bool) -> None:
     """
     One ffmpeg pass into tmp_dest. Streams progress into _progress[dest] as it
-    runs; raises RuntimeError if ffmpeg fails or the output is truncated/corrupt.
+    runs; raises RuntimeError if ffmpeg fails or the output is truncated/corrupt,
+    TranscodeCancelled if cancel_transcode() killed it deliberately (a file
+    marked for deletion or navigated away from mid-transcode - see app.py's
+    api_delete_request/api_cancel_transcode), or
+    TranscodeBusy if no slot freed up within TRANSCODE_QUEUE_TIMEOUT_S (see
+    there - a fast, clear failure instead of blocking the caller's gunicorn
+    worker thread indefinitely).
     The caller renames tmp_dest -> dest on success. Logs one line per successful
     transcode naming the encoder actually used - the startup "Transcoder:" line
     only says what's configured/probed, not what ran for a given file, and a
     silent per-file GPU->software fallback would otherwise be invisible unless
     it happened to fail loudly.
     """
-    started_at = time.monotonic()
-    _progress[dest] = {"total_s": total_s, "current_s": 0.0, "started_at": started_at}
     label = "nvenc" if gpu else "libx264"
-    limiter = _nvenc_sem if gpu else nullcontext()
+    # Baseline for detecting a cancel landing anywhere during this attempt -
+    # see _cancel_generation's comment for the three places it's checked.
+    my_generation = _current_generation(dest)
     try:
-        with limiter:
+        # Both gates apply for gpu=True (the stricter NVENC session cap on top
+        # of the general one); only the general one for software. _progress's
+        # started_at is set only once a slot is actually acquired and encoding
+        # is really beginning, not while merely queued here - otherwise queue
+        # wait would inflate the ETA math in progress_for() once real progress
+        # starts flowing.
+        with _acquire_or_busy(_transcode_sem, "transcode"), \
+             (_acquire_or_busy(_nvenc_sem, "NVENC") if gpu else nullcontext()):
+            if _current_generation(dest) != my_generation:
+                raise TranscodeCancelled(f"transcode of {src.name} was cancelled while queued for a slot - not starting")
+
+            started_at = time.monotonic()
+            _progress[dest] = {"total_s": total_s, "current_s": 0.0, "started_at": started_at}
             # stderr to a temp file, not a pipe: read back only on failure.
             # Two live pipes (progress on stdout, logs on stderr) without
             # threads/select risks a classic subprocess deadlock.
@@ -239,6 +349,8 @@ def _run_transcode(src: Path, tmp_dest: Path, dest: Path, total_s: float, *, gpu
                     _ffmpeg_cmd(src, tmp_dest, gpu=gpu),
                     stdout=subprocess.PIPE, stderr=stderr_log, text=True, bufsize=1,
                 )
+                with _procs_guard:
+                    _active_procs[dest] = proc
                 for line in proc.stdout:
                     key, _, value = line.strip().partition("=")
                     if key == "out_time_us":
@@ -248,6 +360,8 @@ def _run_transcode(src: Path, tmp_dest: Path, dest: Path, total_s: float, *, gpu
                             pass
                 proc.wait()
                 if proc.returncode != 0:
+                    if _current_generation(dest) != my_generation:
+                        raise TranscodeCancelled(f"transcode of {src.name} cancelled (marked for deletion or superseded)")
                     stderr_log.seek(0)
                     raise RuntimeError(f"ffmpeg ({label}) failed for {src}:\n{stderr_log.read()[-2000:]}")
 
@@ -265,6 +379,8 @@ def _run_transcode(src: Path, tmp_dest: Path, dest: Path, total_s: float, *, gpu
         print(f"Transcoded {src.name} with {label} in {elapsed:.1f}s ({speed})")
     finally:
         _progress.pop(dest, None)
+        with _procs_guard:
+            _active_procs.pop(dest, None)
 
 
 def _probe_duration_seconds(src: Path) -> float | None:
@@ -405,7 +521,15 @@ def ensure_transcoded(src: Path, *, rebuild_corrupt: bool = True) -> Path | None
 
     Uses the GPU (nvenc) when DASHCAM_HWACCEL=nvenc and it's usable, retrying
     once with software libx264 if the GPU pass fails. Raises RuntimeError only
-    if that fallback also fails or the output is truncated.
+    if that fallback also fails or the output is truncated - or, uncaught here
+    on purpose (neither retries with software): TranscodeCancelled if
+    cancel_transcode() killed it, or this call was still queued behind
+    _lock_for(dest) when a DIFFERENT caller's attempt for the same file got
+    cancelled (see the generation check just below - no point burning more
+    CPU transcoding a file nobody wants anymore, whichever caller's turn it
+    is), or TranscodeBusy if no transcode slot freed up within
+    TRANSCODE_QUEUE_TIMEOUT_S (retrying would just queue on the same general
+    semaphore that already timed out).
     """
     _prune_stale_cache()
 
@@ -413,7 +537,18 @@ def ensure_transcoded(src: Path, *, rebuild_corrupt: bool = True) -> Path | None
     if _cache_state(dest, src) == "ok":
         return dest
 
+    # Captured BEFORE waiting for the per-file lock, so a cancellation that
+    # happens while THIS call is queued behind someone else's attempt for the
+    # same file is still visible once it's our turn - see _cancel_generation's
+    # comment for the exact race this closes.
+    my_generation = _current_generation(dest)
+
     with _lock_for(dest):
+        if _current_generation(dest) != my_generation:
+            raise TranscodeCancelled(
+                f"transcode of {src.name} was cancelled while queued - not starting"
+            )
+
         state = _cache_state(dest, src)  # may have changed while we waited for the lock
         if state == "ok":
             return dest
@@ -441,6 +576,18 @@ def ensure_transcoded(src: Path, *, rebuild_corrupt: bool = True) -> Path | None
                 tmp_dest.rename(dest)  # atomic - concurrent requests never see a partial file
                 _validated.add(dest)
                 return dest
+            except TranscodeCancelled as e:
+                tmp_dest.unlink(missing_ok=True)
+                print(f"Transcode cancelled for {src.name} - not retrying.")
+                raise e
+            except TranscodeBusy as e:
+                # Retrying with software would just queue on the SAME general
+                # _transcode_sem this already timed out on, doubling the wait
+                # for no benefit - fail fast instead (see app.py's serve_video,
+                # which turns this into a quick 503 rather than a 500).
+                tmp_dest.unlink(missing_ok=True)
+                print(f"Transcode busy for {src.name} - not retrying: {e}")
+                raise e
             except RuntimeError as e:
                 last_error = e
                 tmp_dest.unlink(missing_ok=True)
@@ -449,3 +596,45 @@ def ensure_transcoded(src: Path, *, rebuild_corrupt: bool = True) -> Path | None
                     print(f"WARNING: GPU transcode failed for {src.name}; retrying with software.\n{e}")
 
         raise last_error
+
+
+def cancel_transcode(src: Path) -> bool:
+    """
+    Kill an in-flight transcode of src, if one is currently running right now,
+    and clean up its partial output. Used when a file is marked for deletion
+    (app.py's api_delete_request) or navigated away from before it finished
+    loading (api_cancel_transcode) - no point burning CPU on a transcode
+    nobody's going to watch.
+
+    Always bumps this dest's cancel generation first (see _cancel_generation),
+    regardless of whether anything is actively running - this is what makes a
+    cancel also reach a request that's merely *waiting its turn*, not just one
+    actively running: queued behind _lock_for(dest) for the same file (e.g.
+    an on-demand /video request arriving while a prefetch thread already
+    holds the lock), or queued for a general TRANSCODE_CONCURRENCY/NVENC
+    slot. Confirmed live 2026-09-15 this was a real gap - killing only the
+    *currently running* attempt let a caller already queued behind it start
+    right back up on the same abandoned file.
+
+    Returns True if a job was actually killed outright, False if nothing was
+    actively running for this file (not an error - most calls won't hit an
+    active transcode at all; the generation bump above still happens either
+    way). Leaves no permanent "don't retranscode this" mark: a genuinely NEW
+    request for the same file later - e.g. the maintainer reopens it before
+    actually deleting it from disk - captures the (already-bumped) generation
+    fresh as its own baseline and transcodes normally, same as any other file.
+    """
+    dest = _cache_path(src)
+    _bump_generation(dest)
+    with _procs_guard:
+        proc = _active_procs.get(dest)
+    if proc is None or proc.poll() is not None:
+        return False
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+    print(f"Cancelled in-progress transcode for {src.name}")
+    return True

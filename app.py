@@ -58,6 +58,11 @@ STATE = {
 _reload_lock = threading.Lock()
 _rescan_thread_started = False
 
+# Plain-text, one-filename-per-line list of videos flagged for deletion - see
+# api_delete_request(). /data is read-only to this process by design, so this
+# is only ever a request list; the maintainer deletes the real files by hand.
+PENDING_DELETES_PATH = config.CONFIG_DIR / "pending_deletes.txt"
+
 
 def _local_date(dt_utc, tz) -> str:
     return dt_utc.astimezone(tz).date().isoformat()
@@ -212,7 +217,7 @@ def _last_fix_at_or_before(ts):
     return fixes[idx] if idx >= 0 else None
 
 
-def _stop_json(start_utc, end_utc, lat, lon, tz, *, video_start_utc=None) -> dict:
+def _stop_json(start_utc, end_utc, lat, lon, tz, *, video_start_utc=None, video_count=0) -> dict:
     d = {
         "start": start_utc.isoformat(),
         "start_local": start_utc.astimezone(tz).isoformat(),
@@ -221,12 +226,24 @@ def _stop_json(start_utc, end_utc, lat, lon, tz, *, video_start_utc=None) -> dic
         "lat": lat,
         "lon": lon,
         "duration_s": (end_utc - start_utc).total_seconds(),
+        # Real video FILES (each channel counted separately, e.g. a 3-channel
+        # Parking chunk counts as 3) whose window overlaps this stop, at the
+        # moment the list was generated - see _count_overlapping_segments.
+        # Deliberately counts every file regardless of pending-delete status,
+        # so this number doesn't shift under you as you queue deletions from
+        # the same list.
+        "video_count": video_count,
     }
     # Only present when it differs from `start` - see _first_parking_start_within.
     if video_start_utc is not None and video_start_utc != start_utc:
         d["video_start"] = video_start_utc.isoformat()
         d["video_start_local"] = video_start_utc.astimezone(tz).isoformat()
     return d
+
+
+def _count_overlapping_segments(start, end, segments) -> int:
+    """Count of segments (any channel/source) whose [start_time, coverage_end()) overlaps [start, end)."""
+    return sum(1 for s in segments if s.start_time < end and s.coverage_end() > start)
 
 
 def _first_parking_start_within(start_utc, end_utc):
@@ -325,12 +342,15 @@ def api_stops():
     if date_raw:
         fixes = [fx for fx in fixes if _local_date(fx.timestamp, tz) == date_raw]
 
+    all_segments = STATE["video_segments"] + STATE["parking_segments"]
+
     detected = _detect_stationary_stops(fixes, _stop_min_duration_s(), _stop_max_speed_mph())
     gps_intervals = [(start_fx.timestamp, end_fx.timestamp) for start_fx, end_fx in detected]
     stops = [
         _stop_json(
             start_fx.timestamp, end_fx.timestamp, start_fx.lat, start_fx.lon, tz,
             video_start_utc=_first_parking_start_within(start_fx.timestamp, end_fx.timestamp),
+            video_count=_count_overlapping_segments(start_fx.timestamp, end_fx.timestamp, all_segments),
         )
         for start_fx, end_fx in detected
     ]
@@ -351,7 +371,10 @@ def api_stops():
         loc_fix = _last_fix_at_or_before(seg.start_time)
         if loc_fix is None:
             continue  # no GPS history at all yet before this clip - skip rather than guess a location
-        stops.append(_stop_json(seg.start_time, seg.coverage_end(), loc_fix.lat, loc_fix.lon, tz))
+        stops.append(_stop_json(
+            seg.start_time, seg.coverage_end(), loc_fix.lat, loc_fix.lon, tz,
+            video_count=_count_overlapping_segments(seg.start_time, seg.coverage_end(), all_segments),
+        ))
 
     stops.sort(key=lambda s: s["start"])
     return jsonify(stops)
@@ -392,6 +415,50 @@ def api_coverage():
     return jsonify([{"start": start.isoformat(), "end": end.isoformat()} for start, end in merged])
 
 
+@app.route("/api/segment-boundary")
+def api_segment_boundary():
+    """
+    Given ?ts=<ISO> and ?direction=next|prev, return the nearest OTHER video
+    segment start_time strictly after (next) or before (prev) ts, across
+    every channel and both Normal and Parking/Timelapse. Powers the
+    stop-scrubber's skip buttons - jump directly to the next/previous video
+    chunk within a stop instead of dragging continuously, for walking through
+    (and deleting) a sequence of clips one at a time.
+
+    Same-chunk files across channels share an identical start_time (a
+    Parking chunk's front/interior/rear filenames all encode the same
+    timestamp, just a different trailing channel letter), so the single next
+    distinct start_time naturally advances by a whole chunk, not a fraction
+    of a second.
+
+    Doesn't know or care about "stop" boundaries - stops are a frontend-
+    visible concept (built from STATE["fixes"] + STATE["parking_segments"] by
+    /api/stops) that this lookup doesn't need to re-derive; the frontend
+    clamps the result against the currently-open stop's [start, end) itself.
+
+    Returns {"ts": "<ISO>"}, or {"ts": null} if there's nothing in that direction.
+    """
+    ts_raw = request.args.get("ts")
+    direction = request.args.get("direction")
+    if direction not in ("next", "prev"):
+        return jsonify({"error": "direction must be 'next' or 'prev'"}), 400
+    try:
+        ts = datetime.fromisoformat((ts_raw or "").replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return jsonify({"error": "invalid ts format, expected ISO 8601"}), 400
+
+    starts = {s.start_time for s in STATE["video_segments"] + STATE["parking_segments"]}
+    if direction == "next":
+        candidates = [s for s in starts if s > ts]
+        result = min(candidates) if candidates else None
+    else:
+        candidates = [s for s in starts if s < ts]
+        result = max(candidates) if candidates else None
+    return jsonify({"ts": result.isoformat() if result else None})
+
+
 @app.route("/api/videos")
 def api_videos():
     """
@@ -417,6 +484,7 @@ def api_videos():
         for channel, seg in find_segments_for_timestamp(STATE["parking_segments"], ts).items():
             matches.setdefault(channel, seg)  # Normal wins if both somehow cover the same instant
 
+    pending = _read_pending_deletes()
     result = {}
     for channel, seg in matches.items():
         # compression_ratio is 1.0 for realtime (Normal) segments, so this is
@@ -430,6 +498,7 @@ def api_videos():
             "offset_seconds": offset,
             "start_time": seg.start_time.isoformat(),
             "end_time": seg.coverage_end().isoformat(),
+            "pending_delete": _relative_video_path(seg) in pending,
         }
     return jsonify(result)
 
@@ -446,6 +515,148 @@ def api_transcode_progress():
     if not seg:
         return jsonify({"error": "unknown filename"}), 404
     return jsonify(video_transcode.progress_for(seg.path))
+
+
+def _relative_video_path(seg) -> str:
+    """
+    "Normal/<filename>" or "Parking/<filename>" - the path relative to the
+    data directory. A bare filename alone doesn't tell the maintainer which
+    directory to delete it from when processing pending_deletes.txt by hand,
+    so this is what actually gets written there (see api_delete_request) and
+    checked against (see api_videos's pending_delete flag). seg.path's
+    immediate parent is always exactly the directory scan_video_dir() was
+    called against - this reads that directory's own real name off the
+    already-trusted, scan-discovered path, never anything client-supplied.
+    """
+    return f"{seg.path.parent.name}/{seg.path.name}"
+
+
+def _read_pending_deletes() -> set[str]:
+    """
+    Current pending-deletes list (see api_delete_request) as a set of
+    "Normal/<filename>"-style relative paths, for cheap membership checks.
+    Empty set if the file doesn't exist yet. Shared by api_delete_request (to
+    merge into) and api_videos (to flag a channel that's already queued, so
+    the frontend can show that instead of letting it look identical to an
+    unflagged one).
+    """
+    try:
+        return {line for line in PENDING_DELETES_PATH.read_text().splitlines() if line}
+    except FileNotFoundError:
+        return set()
+
+
+def _cancel_transcodes_for(filenames) -> list[str]:
+    """
+    Cancel any in-flight transcode for each of the given filenames (an
+    unknown filename is skipped silently, not an error - callers that need
+    strict validation, like api_delete_request, already did it themselves
+    before calling this). Returns the subset that actually had something
+    running to kill. Shared by api_delete_request (marked for deletion) and
+    api_cancel_transcode (navigated away from) - both are "stop transcoding
+    whatever's in this list," just triggered for different reasons.
+    """
+    cancelled = []
+    for f in filenames:
+        seg = STATE["segment_by_filename"].get(f)
+        if seg and video_transcode.cancel_transcode(seg.path):
+            cancelled.append(f)
+    return cancelled
+
+
+@app.route("/api/delete-request", methods=["POST"])
+def api_delete_request():
+    """
+    Add filenames to the plain-text pending-deletes list at
+    CONFIG_DIR/pending_deletes.txt (one filename per line, sorted) - never
+    deletes anything itself. /data is mounted read-only into this container
+    deliberately (see CLAUDE.md "Live data reload"); the maintainer deletes
+    the actual files by hand from this list, on their own schedule - there is
+    no processing script.
+
+    Body: {"filenames": [...]} - bare filenames, matching what /api/videos
+    returns. Every filename must already be a real, currently-scanned video -
+    checked against STATE["segment_by_filename"], the same allowlist
+    _resolve_video_path() uses for /video and /original - so this can never
+    be used to write an arbitrary string into a file the maintainer might
+    later feed into a shell loop. What's actually written to the list is the
+    "Normal/<filename>" or "Parking/<filename>" relative path (see
+    _relative_video_path) - a bare filename alone doesn't tell the maintainer
+    which directory to delete it from.
+
+    Merge behavior: the existing list is first filtered down to relative
+    paths STATE still reports as present - so an entry already deleted by
+    hand silently drops off the very next request, with no separate cleanup
+    step needed (a filename the maintainer deleted seconds ago, before the
+    next periodic/triggered rescan, is harmlessly carried forward one more
+    round - same staleness STATE always has, nothing new) - then the newly
+    requested files are added (de-duplicated via a set), then the whole list
+    is rewritten atomically (tmp-file-then-rename, same pattern as
+    auth._write_users) so a concurrent read never sees a half-written file.
+
+    Also cancels any transcode currently in progress for the newly requested
+    filenames (video_transcode.cancel_transcode) - scrolling through a stop's
+    clips can queue up a lot of transcoding, and there's no point finishing
+    one for a file that was just marked for deletion. Harmless no-op per file
+    if nothing was actually transcoding. This does NOT block a future
+    transcode of the same file - if it's viewed again before actually being
+    deleted from disk, it transcodes fresh like any other file.
+    """
+    body = request.get_json(silent=True) or {}
+    filenames = body.get("filenames")
+    if not isinstance(filenames, list) or not filenames:
+        return jsonify({"error": "filenames must be a non-empty list"}), 400
+    unknown = [f for f in filenames if f not in STATE["segment_by_filename"]]
+    if unknown:
+        return jsonify({"error": f"unknown filename(s): {unknown}"}), 400
+
+    requested_paths = {_relative_video_path(STATE["segment_by_filename"][f]) for f in filenames}
+    valid_paths = {_relative_video_path(seg) for seg in STATE["segment_by_filename"].values()}
+    existing = _read_pending_deletes()
+    still_there = existing & valid_paths
+    merged = sorted(still_there | requested_paths)
+
+    try:
+        config.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = PENDING_DELETES_PATH.with_suffix(".txt.tmp")
+        tmp.write_text("\n".join(merged) + ("\n" if merged else ""))
+        tmp.replace(PENDING_DELETES_PATH)
+    except OSError as e:
+        return jsonify({"error": f"could not save pending deletes: {e}"}), 500
+
+    _cancel_transcodes_for(filenames)
+
+    return jsonify({"pending_count": len(merged), "filenames": merged}), 200
+
+
+@app.route("/api/cancel-transcode", methods=["POST"])
+def api_cancel_transcode():
+    """
+    Cancel any in-flight transcode for the given filenames - used when the
+    frontend navigates away from a point/segment before its videos finished
+    loading (see templates/index.html's onPointClick). Without this, clicking
+    through several clips quickly (e.g. the stop-scrubber's skip buttons)
+    leaves a growing backlog of superseded jobs hogging TRANSCODE_CONCURRENCY's
+    scarce slots, so the video you're actually looking at now ends up queued
+    behind several you've already navigated away from - confirmed live
+    2026-09-15, this is what "UI lockup while scrolling through a stop"
+    actually was (not thread starvation - DASHCAM_THREADS=64 already fixed
+    that; this is wasted work piling up ahead of the request that matters).
+
+    Unlike api_delete_request, this never touches pending_deletes.txt and is
+    lenient about unknown filenames (skips rather than rejecting the whole
+    request) - it's a best-effort housekeeping call, not a confirmed user
+    action, and most calls will cancel nothing since most navigations happen
+    after a video already finished loading.
+
+    Body: {"filenames": [...]}. Returns {"cancelled": [...]} - the subset
+    that actually had something running to kill.
+    """
+    body = request.get_json(silent=True) or {}
+    filenames = body.get("filenames")
+    if not isinstance(filenames, list):
+        return jsonify({"error": "filenames must be a list"}), 400
+    return jsonify({"cancelled": _cancel_transcodes_for(filenames)})
 
 
 def _resolve_video_path(filename):
@@ -477,11 +688,30 @@ def serve_video(filename):
     element (plays audio/duration, shows a black frame) - so this transcodes
     to H.264 on first request and serves the cached result on every request
     after that. The first request for a given file blocks until the
-    transcode finishes; app.run(threaded=True) keeps that from stalling any
-    other concurrent request (other videos, API calls, etc).
+    transcode finishes; app.run(threaded=True) (dev) / gunicorn's threads
+    (deployed) keep that from stalling any other concurrent request (other
+    videos, API calls, etc) - see gunicorn.conf.py's DASHCAM_THREADS comment.
+
+    A 503 (not the generic 500 an unhandled exception would give) means
+    video_transcode.TRANSCODE_CONCURRENCY's slots were all busy and stayed
+    that way past TRANSCODE_QUEUE_TIMEOUT_S - a real "try again shortly", not
+    a broken file; Retry-After suggests when. A 409 means this exact request
+    was cancelled - either directly (marked for deletion mid-transcode) or
+    because it was still queued behind another attempt for the same file that
+    got cancelled out from under it (see video_transcode.cancel_transcode) -
+    expected whenever the frontend navigates away before a video finishes
+    loading, not a real failure.
     """
     src = _resolve_video_path(filename)
-    transcoded = video_transcode.ensure_transcoded(src)  # on-demand: always returns a path (or raises)
+    try:
+        transcoded = video_transcode.ensure_transcoded(src)  # on-demand: always returns a path (or raises)
+    except video_transcode.TranscodeBusy as e:
+        resp = jsonify({"error": str(e)})
+        resp.status_code = 503
+        resp.headers["Retry-After"] = str(int(video_transcode.TRANSCODE_QUEUE_TIMEOUT_S))
+        return resp
+    except video_transcode.TranscodeCancelled as e:
+        return jsonify({"error": str(e)}), 409
 
     seg = STATE["segment_by_filename"].get(filename)
     if seg:
@@ -526,6 +756,20 @@ def _prefetch_neighbors(seg):
     `seg` isn't a member of that list, so `siblings.index(seg)` below raises
     ValueError and this is a silent no-op for it - the clip itself still
     serves fine, it just doesn't get neighbor-prefetch warming.
+
+    Skips a neighbor that's already in pending_deletes.txt - marking a file
+    for deletion doesn't remove it from disk (the maintainer does that by
+    hand later), so it's still a perfectly normal-looking prefetch target
+    with no idea anyone's asked for it to go away. Confirmed live 2026-09-15
+    on a 4-core host: a deleted-and-cancelled file's prefetch (queued earlier,
+    from before it was deleted) went on to transcode anyway minutes later,
+    consuming a scarce TRANSCODE_CONCURRENCY slot - and 4 concurrent
+    "ultrafast" software encodes are enough to saturate 4 cores entirely,
+    starving the Python process itself, not just the transcode queue. This is
+    speculative work only, so skipping it is a pure win with no downside - if
+    the maintainer deliberately reopens the file later, the on-demand /video
+    path still transcodes it fresh, same as any other file (see
+    api_delete_request's docstring).
     """
     if seg.path.name in _prefetched_from:
         return
@@ -536,10 +780,11 @@ def _prefetch_neighbors(seg):
         idx = siblings.index(seg)
     except ValueError:
         return
+    pending = _read_pending_deletes()
     neighbors = [s for s in (
         siblings[idx - 1] if idx > 0 else None,
         siblings[idx + 1] if idx + 1 < len(siblings) else None,
-    ) if s is not None]
+    ) if s is not None and _relative_video_path(s) not in pending]
     for neighbor in neighbors:
         threading.Thread(target=_background_transcode, args=(neighbor.path,), daemon=True).start()
 

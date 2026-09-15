@@ -52,11 +52,11 @@
     #stops { border-bottom: 1px solid #2a2d36; }
     #stops-header { padding: 8px 10px 4px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: #6b7280; }
     #stops-list { max-height: 160px; overflow-y: auto; }
-    .stop-row { display: flex; justify-content: space-between; padding: 6px 10px; font-size: 12px; cursor: pointer; color: #c3c8d4; }
+    .stop-row { display: flex; justify-content: space-between; gap: 8px; padding: 6px 10px; font-size: 12px; cursor: pointer; color: #c3c8d4; }
     .stop-row:hover { background: #232838; }
     .stop-row.active { background: #2b6cff; color: #fff; }
-    .stop-row-duration { color: #9aa2b1; }
-    .stop-row.active .stop-row-duration { color: #dbe4ff; }
+    .stop-row-duration, .stop-row-count { color: #9aa2b1; }
+    .stop-row.active .stop-row-duration, .stop-row.active .stop-row-count { color: #dbe4ff; }
 
     /* Map marker for a stop - a filled square (vs. the route's colored line
        and the round blue positionMarker dot) so it reads as a distinct kind
@@ -87,7 +87,13 @@
     #stop-scrubber.hidden { display: none; }
     #stop-scrubber-times { display: flex; justify-content: space-between; align-items: baseline; font-size: 12px; color: #9aa2b1; margin-bottom: 6px; gap: 8px; }
     #stop-scrubber-current { color: #fff; font-weight: 600; font-size: 13px; }
-    #stop-scrubber input[type=range] { width: 100%; accent-color: #2b6cff; display: block; }
+    #stop-scrubber-row { display: flex; align-items: center; gap: 8px; }
+    #stop-scrubber-row input[type=range] { flex: 1 1 auto; min-width: 0; accent-color: #2b6cff; }
+    #stop-scrubber-row button {
+      flex: 0 0 auto; width: 26px; height: 26px; padding: 0; display: flex; align-items: center; justify-content: center;
+      background: #2a2d36; color: #e7e9ee; border: none; border-radius: 5px; cursor: pointer; font-size: 11px;
+    }
+    #stop-scrubber-row button:hover { background: #383d4a; }
 
     #info { padding: 10px; border-top: 1px solid #2a2d36; font-size: 13px; color: #c3c8d4; }
     #info b { color: #fff; }
@@ -112,6 +118,68 @@
       padding: 6px 10px; font-size: 12px;
     }
     #follow-toggle.active { color: #fff; border-color: #2b6cff; background: #2b6cff; }
+
+    /* Delete-request button + confirm panel + status toast. All position:fixed,
+       so (like #theater-exit) they sit outside CSS Grid layout entirely and
+       need no theater-mode handling regardless of which mode is active or
+       which element they're nested under - see the long comment above
+       #layout.theater for why a *grid-participating* element would need one.
+       z-index must clear Leaflet's own internal panes (tile/overlay/marker/
+       popup panes run up to ~700) - #follow-toggle/#stop-scrubber already
+       needed 1000 for exactly this reason. Without it, over the map these
+       would render fully hidden BEHIND the tile layer while still showing
+       through over #side (nothing there competes for stacking) - looks like
+       only the sidebar darkens and the confirm box never appears at all
+       (confirmed live 2026-09-15: no request ever reached the backend,
+       because the box - centered across the whole viewport, so mostly over
+       the map - was invisible under the tiles the whole time). */
+    #delete-btn {
+      display: none; position: fixed; bottom: 12px; right: 12px; z-index: 1000;
+      background: #3a1f24; color: #f3b4b4; border: 1px solid #5c2a30; border-radius: 6px;
+      padding: 10px 16px; cursor: pointer; font-size: 14px; font-weight: 600;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+    }
+    #delete-btn:hover { background: #4a262c; }
+    #delete-btn.visible { display: block; }
+
+    #delete-confirm {
+      display: none; position: fixed; inset: 0; z-index: 2000;
+      background: rgba(0,0,0,0.6); align-items: center; justify-content: center;
+    }
+    #delete-confirm.visible { display: flex; }
+    #delete-confirm-box {
+      background: #181b22; border: 1px solid #2a2d36; border-radius: 8px;
+      padding: 18px 20px; width: min(420px, calc(100vw - 32px)); box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+    }
+    #delete-confirm-box h3 { margin: 0 0 10px; font-size: 15px; color: #e7e9ee; }
+    #delete-confirm-list { list-style: none; margin: 0 0 16px; padding: 0; font-size: 13px; color: #c3c8d4; }
+    #delete-confirm-list li { padding: 4px 0; border-bottom: 1px solid #2a2d36; }
+    #delete-confirm-actions { display: flex; justify-content: flex-end; gap: 8px; }
+    #delete-confirm-actions button {
+      border: none; border-radius: 6px; padding: 8px 14px; cursor: pointer; font-size: 13px; font-weight: 600;
+    }
+    #delete-cancel-btn { background: #2a2d36; color: #e7e9ee; }
+    #delete-cancel-btn:hover { background: #383d4a; }
+    #delete-confirm-btn { background: #b91c1c; color: #fff; }
+    #delete-confirm-btn:hover { background: #991515; }
+
+    /* Generic brief-message toast - used for delete-request status and for
+       the stop-scrubber skip buttons ("no more clips in this direction"). */
+    #toast {
+      display: none; position: fixed; bottom: 60px; right: 12px; z-index: 1000;
+      background: rgba(20,22,28,0.95); border: 1px solid #2a2d36; border-radius: 6px;
+      padding: 8px 14px; font-size: 12px; color: #c3c8d4; box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+    }
+    #toast.visible { display: block; }
+
+    /* Per-channel badge, shown in a .video-label bar when that channel's
+       filename is already in pending_deletes.txt (see /api/videos's
+       pending_delete field) - otherwise an already-flagged video looks
+       identical to an unflagged one with no way to tell. */
+    .pending-delete-badge {
+      color: #f3b4b4; background: #3a1f24; border: 1px solid #5c2a30; border-radius: 4px;
+      padding: 1px 6px; font-size: 10px; text-transform: none; letter-spacing: normal;
+    }
 
     /*
      * Theater mode is a 2x2 grid with FIXED corners regardless of which
@@ -182,7 +250,11 @@
           <span id="stop-scrubber-current"></span>
           <span id="stop-scrubber-end"></span>
         </div>
-        <input type="range" id="stop-scrubber-range" min="0" max="0" step="1" value="0">
+        <div id="stop-scrubber-row">
+          <button id="stop-skip-prev" title="Jump to the previous video clip in this stop">&#9664;</button>
+          <input type="range" id="stop-scrubber-range" min="0" max="0" step="1" value="0">
+          <button id="stop-skip-next" title="Jump to the next video clip in this stop">&#9654;</button>
+        </div>
       </div>
     </div>
     <div id="side">
@@ -205,12 +277,25 @@
     </div>
   </div>
 
+  <button id="delete-btn">&#128465; Delete</button>
+  <div id="delete-confirm">
+    <div id="delete-confirm-box">
+      <h3>Mark these files for deletion?</h3>
+      <ul id="delete-confirm-list"></ul>
+      <div id="delete-confirm-actions">
+        <button id="delete-cancel-btn">Cancel</button>
+        <button id="delete-confirm-btn">Mark for deletion</button>
+      </div>
+    </div>
+  </div>
+  <div id="toast"></div>
+
 <script>
 // fetch() wrapper: if the session has gone away (cookie cleared, secret key
 // rotated), the backend answers API calls with 401 - bounce to the login page
 // rather than letting the UI fail silently.
-async function apiFetch(url) {
-  const res = await fetch(url);
+async function apiFetch(url, options = {}) {
+  const res = await fetch(url, options);
   if (res.status === 401) {
     window.location = '/login';
     throw new Error('not authenticated');
@@ -348,7 +433,9 @@ function renderStopsList() {
   stops.forEach((stop, i) => {
     const row = document.createElement('div');
     row.className = 'stop-row' + (i === activeStopIndex ? ' active' : '');
-    row.innerHTML = `<span>${formatStopRange(stop)}</span><span class="stop-row-duration">${formatDurationS(stop.duration_s)}</span>`;
+    row.innerHTML = `<span>${formatStopRange(stop)}</span>` +
+      `<span class="stop-row-count">${stop.video_count} video${stop.video_count === 1 ? '' : 's'}</span>` +
+      `<span class="stop-row-duration">${formatDurationS(stop.duration_s)}</span>`;
     row.addEventListener('click', () => selectStop(i));
     list.appendChild(row);
     stop._row = row;
@@ -479,6 +566,34 @@ scrubberRange.addEventListener('change', () => {
   if (!scrubberStop) return;
   scrubToInstant(scrubberStop, Date.parse(scrubberStop.start) + Number(scrubberRange.value) * 1000, { commit: true });
 });
+
+// Jump directly to the next/previous video chunk within the open stop,
+// rather than dragging continuously - makes walking through (and deleting)
+// a sequence of clips in one stop much faster. /api/segment-boundary knows
+// nothing about "stops" - it just finds the nearest other segment start in
+// either direction - so clamping to the open stop's own [start, end) happens
+// here, not server-side.
+async function skipToNeighborSegment(direction) {
+  if (!scrubberStop) return;
+  const stop = scrubberStop;
+  const curMs = Date.parse(stop.start) + Number(scrubberRange.value) * 1000;
+  const res = await apiFetch(`/api/segment-boundary?ts=${encodeURIComponent(new Date(curMs).toISOString())}&direction=${direction}`);
+  const data = await res.json();
+  const noMore = () => showToast(direction === 'next'
+    ? 'No more clips after this one in this stop.'
+    : 'No more clips before this one in this stop.');
+  if (!data.ts) { noMore(); return; }
+  const targetMs = Date.parse(data.ts);
+  if (targetMs < Date.parse(stop.start) || targetMs >= Date.parse(stop.end)) { noMore(); return; }
+  onPointClick({
+    t: new Date(targetMs).toISOString(),
+    t_local: localIsoForStop(stop, targetMs),
+    lat: stop.lat, lon: stop.lon,
+    speed_mph: 0, speed_kmh: 0, alt_m: 0,
+  });
+}
+document.getElementById('stop-skip-prev').addEventListener('click', () => skipToNeighborSegment('prev'));
+document.getElementById('stop-skip-next').addEventListener('click', () => skipToNeighborSegment('next'));
 
 const followToggleEl = document.getElementById('follow-toggle');
 followToggleEl.addEventListener('click', () => {
@@ -630,6 +745,8 @@ async function selectDay(dateStr) {
   document.getElementById('videos').innerHTML =
     '<div class="empty-msg">Click a point on the track to load nearby video.</div>';
   document.getElementById('info').textContent = `${dateStr} - click the path to inspect a point.`;
+  activeVideos = [];
+  reconcileVideoState();  // switching days abandons anything still pending from the last one
 
   trackLayer.clearLayers();
   renderStopsList();
@@ -683,9 +800,21 @@ async function selectDay(dateStr) {
 }
 
 // Channels currently loaded, for cross-channel synced playback:
-// [{ channel, el, startMs, endMs }, ...] - startMs/endMs are the segment's
-// start_time/end_time (coverage window) as epoch ms.
+// [{ channel, el, filename, startMs, endMs }, ...] - startMs/endMs are the
+// segment's start_time/end_time (coverage window) as epoch ms.
 let activeVideos = [];
+// Every filename currently asked of the server that hasn't yet resolved
+// (loaded, errored, or been cancelled) - NOT the same as activeVideos, which
+// only reflects the single most-recently-loaded point. Rapid clicking (e.g.
+// the stop-scrubber's skip buttons) can fire several onPointClick() calls
+// before earlier ones' <video> requests settle; diffing only against the
+// immediately-preceding point misses anything further back, leaving orphaned
+// requests blocked server-side (up to TRANSCODE_QUEUE_TIMEOUT_S) with their
+// progress-poll timers running forever - confirmed live 2026-09-15, after
+// ~10 clicks several old segments were still polling minutes later. This set
+// is reconciled against the FULL history on every click instead, so nothing
+// gets permanently orphaned regardless of how fast you click through.
+let trackedFilenames = new Set();
 let syncingPlayback = false;   // synchronous re-entrancy guard while we drive the follower elements
 let seekMuteUntil = 0;         // performance.now() until which follower 'seeked' events are ignored -
                               // a programmatic currentTime write fires 'seeked' too, and without this
@@ -793,11 +922,18 @@ function resyncFollowers(lead) {
 // segment so playback time keeps moving forward.
 function advanceGroupToNextSegment() {
   if (advancingToNext || activeVideos.length === 0) return;
-  if (activeVideos.every(a => a.broken) && ++failedAdvanceStreak > 3) {
-    document.getElementById('info').textContent =
-      'Playback stopped: several segments in a row could not be prepared. ' +
-      'Check the source media, then click the track to retry.';
-    return;
+  if (activeVideos.every(a => a.broken)) {
+    if (activeVideos.some(a => a.cancelledForDeletion)) {
+      // Broken because we just deleted it, not because it's genuinely bad -
+      // that's real progress, same as a successful load. Reset rather than
+      // count it toward the circuit breaker below.
+      failedAdvanceStreak = 0;
+    } else if (++failedAdvanceStreak > 3) {
+      document.getElementById('info').textContent =
+        'Playback stopped: several segments in a row could not be prepared. ' +
+        'Check the source media, then click the track to retry.';
+      return;
+    }
   }
   // Advance to the first track point at/after the furthest-reaching loaded
   // segment - by API coverage window (a.endMs) and by real playback duration,
@@ -856,6 +992,7 @@ async function onPointClick(point, { autoplay = false } = {}) {
     setActiveStop(stopIdx);
     if (stopIdx >= 0) showStopScrubberFor(stops[stopIdx], Date.parse(point.t));
     else hideStopScrubber();
+    reconcileVideoState();
     return;
   }
   for (const channel of channels) {
@@ -864,6 +1001,7 @@ async function onPointClick(point, { autoplay = false } = {}) {
     block.className = `video-block channel-${channel}`;
     block.innerHTML = `<div class="video-label">
         <span>${channel}</span>
+        ${seg.pending_delete ? '<span class="pending-delete-badge">Flagged for deletion</span>' : ''}
         <a class="video-download" href="/original/${encodeURIComponent(seg.filename)}" download title="Download the original, full-resolution file (not the browser-playable transcode)">&#8681; original</a>
       </div>
       <div class="video-status">
@@ -887,12 +1025,12 @@ async function onPointClick(point, { autoplay = false } = {}) {
     // to 1 (realtime) right at a segment's own start, where elapsed is 0.
     const elapsedRealS = (Date.parse(point.t) - startMs) / 1000;
     const ratio = elapsedRealS > 0 ? seg.offset_seconds / elapsedRealS : 1;
-    const av = { channel, el: v, startMs, endMs: Date.parse(seg.end_time), broken: false, ratio };
+    const av = { channel, el: v, filename: seg.filename, startMs, endMs: Date.parse(seg.end_time), broken: false, cancelledForDeletion: false, ratio };
+    trackedFilenames.add(seg.filename);
 
     v.addEventListener('loadedmetadata', () => { v.currentTime = seg.offset_seconds; });
     v.addEventListener('loadeddata', () => {
-      status.remove();
-      stopProgressPolling(status);
+      markResolved(status, seg.filename);
       failedAdvanceStreak = 0;  // a channel became playable - we're making real progress again
       if (autoplay) v.play();
     });
@@ -922,8 +1060,7 @@ async function onPointClick(point, { autoplay = false } = {}) {
       // (blanked) rather than leaving a dead "preparing..." panel, and don't
       // let it wedge the group - if it's the last one outstanding, advance.
       av.broken = true;
-      status.remove();
-      stopProgressPolling(status);
+      markResolved(status, seg.filename);
       gapNote.textContent = 'Video unavailable for this segment.';
       block.classList.add('gap');
       if (groupFinished()) advanceGroupToNextSegment();
@@ -945,13 +1082,95 @@ async function onPointClick(point, { autoplay = false } = {}) {
   setActiveStop(stopIdx);
   if (stopIdx >= 0) showStopScrubberFor(stops[stopIdx], Date.parse(point.t));
   else hideStopScrubber();
+  reconcileVideoState();
 }
+
+const deleteBtnEl = document.getElementById('delete-btn');
+const deleteConfirmEl = document.getElementById('delete-confirm');
+const toastEl = document.getElementById('toast');
+function hideDeleteConfirm() { deleteConfirmEl.classList.remove('visible'); }
+
+// Reconcile UI/server state with whatever's now loaded (possibly nothing) -
+// called after every point load, including "nothing loaded" (a day switch,
+// or a point with no video at all): show/hide the delete button, and cancel
+// any previously-tracked transcode that isn't part of the current set (see
+// trackedFilenames above and /api/cancel-transcode) - reconciled against the
+// FULL tracked history each time, not just the immediately-preceding point,
+// so nothing gets permanently orphaned no matter how fast you click through
+// a stop's clips. The cancel request is best-effort: a failure doesn't
+// affect playback of what's currently loading.
+function reconcileVideoState() {
+  deleteBtnEl.classList.toggle('visible', activeVideos.length > 0);
+  const currentFilenames = activeVideos.map(a => a.filename);
+  const abandoned = [...trackedFilenames].filter(f => !currentFilenames.includes(f));
+  if (abandoned.length === 0) return;
+  abandoned.forEach(f => trackedFilenames.delete(f));
+  apiFetch('/api/cancel-transcode', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ filenames: abandoned }),
+  }).catch(() => {});
+}
+
+let _toastTimer = null;
+function showToast(text) {
+  toastEl.textContent = text;
+  toastEl.classList.add('visible');
+  clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => toastEl.classList.remove('visible'), 4000);
+}
+
+deleteBtnEl.addEventListener('click', () => {
+  if (activeVideos.length === 0) return;
+  document.getElementById('delete-confirm-list').innerHTML =
+    activeVideos.map(a => `<li>${a.channel} &mdash; ${a.filename}</li>`).join('');
+  deleteConfirmEl.classList.add('visible');
+});
+document.getElementById('delete-cancel-btn').addEventListener('click', hideDeleteConfirm);
+// Clicking the dimmed backdrop (not the box itself) also cancels.
+deleteConfirmEl.addEventListener('click', (e) => { if (e.target === deleteConfirmEl) hideDeleteConfirm(); });
+document.getElementById('delete-confirm-btn').addEventListener('click', async () => {
+  const markedVideos = activeVideos;  // captured now - activeVideos may be reassigned before the request resolves
+  const filenames = markedVideos.map(a => a.filename);
+  hideDeleteConfirm();
+  if (filenames.length === 0) return;
+  try {
+    const res = await apiFetch('/api/delete-request', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filenames }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      showToast(`Delete request failed: ${data.error || res.status}`);
+      return;
+    }
+    // These channels are about to error out (their transcode was just
+    // cancelled server-side) - that's expected, not a sign of a genuinely
+    // broken file, so advanceGroupToNextSegment()'s circuit breaker
+    // (failedAdvanceStreak) shouldn't count it the same way. Without this,
+    // deleting several clips in a row in the same stop falsely tripped
+    // "Playback stopped: several segments in a row could not be prepared" -
+    // confirmed live 2026-09-15.
+    markedVideos.forEach(a => { a.cancelledForDeletion = true; });
+    showToast(`Marked ${filenames.length} file(s) for deletion (${data.pending_count} pending total).`);
+  } catch (e) {
+    showToast('Delete request failed - check your connection.');
+  }
+});
 
 const _progressTimers = new WeakMap();
 
 function stopProgressPolling(status) {
   const id = _progressTimers.get(status);
   if (id) clearInterval(id);
+}
+
+// Cleanup shared by a channel's loadeddata and error handlers - either way
+// it's no longer "in flight" from the frontend's perspective.
+function markResolved(status, filename) {
+  status.remove();
+  stopProgressPolling(status);
+  trackedFilenames.delete(filename);
 }
 
 function pollTranscodeProgress(status, filename) {
