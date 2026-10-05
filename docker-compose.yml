@@ -75,6 +75,11 @@ services:
       # How long a request waits for a slot above before failing fast (503)
       # instead of blocking its worker thread forever.
       DASHCAM_TRANSCODE_QUEUE_TIMEOUT: "${DASHCAM_TRANSCODE_QUEUE_TIMEOUT:-90}"
+      # Cached transcodes older than this many days are pruned automatically.
+      # Lower this on a dev/staging instance sharing a small disk with
+      # production (see docker-compose.yml's second-instance notes) so its
+      # cache doesn't grow to fill the volume.
+      DASHCAM_MAX_CACHE_AGE_DAYS: "${DASHCAM_MAX_CACHE_AGE_DAYS:-14}"
       # NVIDIA_DRIVER_CAPABILITIES: "compute,video,utility"   # needed for nvenc
       # Pick up newly-synced footage without a restart:
       #  - RESCAN_INTERVAL: seconds between background re-scans (0 = off, 30s floor)

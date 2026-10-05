@@ -226,8 +226,21 @@
      * than the cell and .video-block's `overflow: hidden` clips the bottom -
      * which is exactly where the native play/pause/scrubber controls live.
      * Fill the cell exactly and letterbox instead of overflowing.
+     *
+     * height:100% alone isn't enough, though: .video-block's children are in
+     * normal block flow (.video-label sits above <video>), so a <video> at
+     * height:100% of .video-block's content box is exactly .video-label's own
+     * height (~22px) TALLER than the cell can hold, silently clipped off the
+     * bottom by .video-block's overflow:hidden - which is exactly where the
+     * camera's burned-in on-screen timestamp sits (confirmed live 2026-09-21:
+     * the timestamp was cut off in theater mode, legible in the sidebar,
+     * where .video-block has no fixed height to overflow). Making .video-block
+     * a flex column instead gives .video-label its natural height and lets
+     * <video> (flex:1, min-height:0 so it can shrink below its own natural
+     * size) take exactly what's left - no overflow, no clipping.
      */
-    #layout.theater .video-block video { width: 100%; height: 100%; object-fit: contain; }
+    #layout.theater .video-block { display: flex; flex-direction: column; }
+    #layout.theater .video-block video { width: 100%; flex: 1 1 auto; min-height: 0; object-fit: contain; }
   </style>
 </head>
 <body>

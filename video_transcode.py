@@ -14,9 +14,10 @@ Encoder is chosen by $DASHCAM_HWACCEL:
 
 Each source file is transcoded once and cached under the user's XDG cache
 dir (outside the repo), keyed by its resolved path. Cached files older than
-MAX_CACHE_AGE_DAYS are deleted automatically (see _prune_stale_cache) so the
-cache doesn't grow forever - this is enforced by the app itself rather than
-relying on /tmp or any OS/distro-specific cleanup policy.
+MAX_CACHE_AGE_DAYS (default 14, override with $DASHCAM_MAX_CACHE_AGE_DAYS)
+are deleted automatically (see _prune_stale_cache) so the cache doesn't grow
+forever - this is enforced by the app itself rather than relying on /tmp or
+any OS/distro-specific cleanup policy.
 """
 from __future__ import annotations
 
@@ -144,7 +145,7 @@ class TranscodeCancelled(RuntimeError):
     """
 
 # depend on the filesystem's atime tracking being enabled.
-MAX_CACHE_AGE_DAYS = 14
+MAX_CACHE_AGE_DAYS = float(os.environ.get("DASHCAM_MAX_CACHE_AGE_DAYS", "14"))
 _PRUNE_CHECK_INTERVAL_S = 3600  # how often to even check; pruning itself is cheap but no need to stat every file on every request
 
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "dashcam-viewer" / "transcoded"
