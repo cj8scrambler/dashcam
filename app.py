@@ -31,7 +31,7 @@ import config
 import gps_parser
 import video_transcode
 from gps_parser import load_gps_dir
-from video_matcher import scan_video_dir, find_segments_for_timestamp
+from video_matcher import scan_video_dir, find_segments_for_timestamp, FILENAME_PATTERN
 
 app = Flask(__name__)
 
@@ -732,29 +732,67 @@ def serve_original(filename):
     return send_from_directory(src.parent, src.name, conditional=True, as_attachment=True)
 
 
-# Segments we've already kicked off neighbor-prefetch for this run, so a burst
-# of range requests while a <video> loads/scrubs doesn't spawn a new pair of
+# Files we've already counted toward their recording-group's completion (see
+# _prefetch_neighbors) - a <video> element's metadata probe plus range
+# requests call serve_video many times for the same file while it loads/
+# scrubs, and each shouldn't count as a fresh "this channel finished". Cleared
+# on reload alongside _group_progress (below) - new footage often lands at
+# the live edge, so re-counting there is wanted.
+_served_files: set[str] = set()
+
+# group key -> channels of that recording moment already counted as served.
+# A "group" is every channel's file from one recording moment (see
+# _segment_group_key) - popped once it's complete, so this only ever holds
+# in-progress groups.
+_group_progress: dict[str, set[str]] = defaultdict(set)
+_group_progress_lock = threading.Lock()
+
+# Segments we've already kicked off next-segment prefetch for, so a burst of
+# range requests while a <video> loads/scrubs doesn't spawn a new pair of
 # ffprobe/ffmpeg threads each time (that CPU churn is enough to stutter the
 # clip that's actually playing). Never reset - re-warming after a cache prune
 # just happens on demand instead, which is fine.
 _prefetched_from: set[str] = set()
 
 
+def _segment_group_key(seg) -> str | None:
+    """
+    Id shared by every channel's file from the same recording moment -
+    derived from the filename's date/time/seq, which the camera writes
+    identically across channels and only the trailing channel letter
+    distinguishes. None for a filename that doesn't match the Normal-mode
+    pattern (prefetch only supports Normal segments - see _prefetch_neighbors).
+    """
+    m = FILENAME_PATTERN.match(seg.path.name)
+    return f"{m.group('date')}_{m.group('time')}_{m.group('seq')}" if m else None
+
+
 def _prefetch_neighbors(seg):
     """
-    The first time a segment is served, kick off background transcoding of that
-    same channel's adjacent segments - so scrubbing forward/backward along the
-    track, or auto-advancing at end-of-segment, doesn't re-hit the ~1 minute
+    Once every channel of the CURRENT recording moment ("set") has finished
+    its own on-demand transcode, kick off background transcoding of each of
+    those channels' single NEXT same-channel segment - so auto-advancing to
+    the next segment (or scrubbing forward) doesn't re-hit the ~1 minute
     first-view wait. Fires in daemon threads and doesn't block the response.
+
+    Previously fired per-channel, independently, the instant that one
+    channel's own transcode finished, and warmed both the next AND previous
+    neighbor. Changed 2026-10-04: in production, the previous-segment
+    prefetch turned out to be rarely used, and firing a channel's own
+    prefetch the moment IT finished meant that prefetch work could start
+    competing for transcode slots with a sibling channel of the SAME moment
+    that hadn't even started its own first-view transcode yet. Waiting for
+    the whole set, and dropping "previous" entirely, means prefetch work
+    never competes with footage the user is actually waiting on right now.
 
     Prefetch passes rebuild_corrupt=False: a neighbour that was never
     transcoded gets warmed, but one whose cached file is corrupt is only
     evicted, not rebuilt - that waits until the file is actually requested for
     playback.
 
-    Only looks at STATE["segments_by_channel"] (Normal). A Parking/Timelapse
-    `seg` isn't a member of that list, so `siblings.index(seg)` below raises
-    ValueError and this is a silent no-op for it - the clip itself still
+    Only looks at STATE["segments_by_channel"] (Normal) - _segment_group_key
+    returns None for anything else, so a Parking/Timelapse `seg` is still a
+    silent no-op here, same limitation as before - the clip itself still
     serves fine, it just doesn't get neighbor-prefetch warming.
 
     Skips a neighbor that's already in pending_deletes.txt - marking a file
@@ -771,21 +809,38 @@ def _prefetch_neighbors(seg):
     path still transcodes it fresh, same as any other file (see
     api_delete_request's docstring).
     """
-    if seg.path.name in _prefetched_from:
+    if seg.path.name in _served_files:
         return
-    _prefetched_from.add(seg.path.name)
+    _served_files.add(seg.path.name)
 
-    siblings = STATE["segments_by_channel"].get(seg.channel, [])
-    try:
-        idx = siblings.index(seg)
-    except ValueError:
+    group_key = _segment_group_key(seg)
+    if group_key is None:
         return
+
+    with _group_progress_lock:
+        served = _group_progress[group_key]
+        served.add(seg.channel)
+        group_channels = {
+            channel for channel, segs in STATE["segments_by_channel"].items()
+            if any(_segment_group_key(s) == group_key for s in segs)
+        }
+        if not group_channels or not group_channels <= served:
+            return
+        del _group_progress[group_key]
+
     pending = _read_pending_deletes()
-    neighbors = [s for s in (
-        siblings[idx - 1] if idx > 0 else None,
-        siblings[idx + 1] if idx + 1 < len(siblings) else None,
-    ) if s is not None and _relative_video_path(s) not in pending]
-    for neighbor in neighbors:
+    for channel in group_channels:
+        siblings = STATE["segments_by_channel"].get(channel, [])
+        current = next((s for s in siblings if _segment_group_key(s) == group_key), None)
+        if current is None or current.path.name in _prefetched_from:
+            continue
+        idx = siblings.index(current)
+        if idx + 1 >= len(siblings):
+            continue
+        neighbor = siblings[idx + 1]
+        if _relative_video_path(neighbor) in pending:
+            continue
+        _prefetched_from.add(current.path.name)
         threading.Thread(target=_background_transcode, args=(neighbor.path,), daemon=True).start()
 
 
@@ -911,9 +966,11 @@ def reload_state() -> dict:
         prev = STATE
         new = _build_state(prev["_data_dir"], prev["_record_tz"], prev["display_tz"])
         STATE = new  # single assignment - readers never see a half-updated snapshot
-        # New footage often lands at the "live edge"; clear the prefetch guard so
-        # the next /video request re-warms neighbours around it.
+        # New footage often lands at the "live edge"; clear the prefetch guards
+        # so the next /video request re-warms neighbours around it.
         _prefetched_from.clear()
+        _served_files.clear()
+        _group_progress.clear()
         summary = {
             "fixes": len(new["fixes"]),
             "segments": len(new["video_segments"]),
