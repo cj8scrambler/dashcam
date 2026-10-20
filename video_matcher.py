@@ -9,9 +9,10 @@ Filename format (Vantrue N4S) is the same shape for every recording mode:
 <seq> is a 5-digit per-boot sequence number (unused, ignored).
 <channel> is A (front), B (interior); C (rear). <mode> is "N" for Normal
 (continuous driving, the default scan_video_dir() mode), "T" for Parking-mode
-Timelapse, "E" for a motion/impact Event (inside Parking/ or the top-level
-Event/ directory - not handled yet). Loop segment length is detected from the
-data itself - see _detect_loop_seconds().
+Timelapse, "E" for a motion/impact Event - inside the top-level Event/
+directory (see scan_event_dir/EventClip) or inside Parking/ (that second
+location still not handled - see CLAUDE.md's "Possible future work"). Loop
+segment length is detected from the data itself - see _detect_loop_seconds().
 
 A segment's coverage window ends at start + detected loop length, but is
 capped at the next same-channel segment's start when the camera resumed
@@ -33,6 +34,7 @@ from __future__ import annotations
 import re
 import statistics
 import threading
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -76,6 +78,15 @@ DEFAULT_SEGMENT_LENGTH_SECONDS = 300
 # scan_video_dir). Real confirmed per-chunk intervals topped out at 360s;
 # this gives ~5x headroom above that before assuming two unrelated sessions.
 MAX_TIMELAPSE_EXTEND_S = 30 * 60
+
+# How often (seconds) scan_video_dir(measure_duration=True) prints a progress
+# line while ffprobing files - see that loop's comment for why this exists at
+# all. Time-based, not count-based, so a fully-cached re-scan (near-instant -
+# see _probe_file_duration's cache) doesn't spam dozens of progress lines
+# just because there happen to be thousands of files, while a genuinely slow
+# cold probe (confirmed live 2026-10-15: ~4 minutes for 3732 real Parking
+# files on first boot after a container rebuild) still gets a heartbeat.
+DURATION_PROBE_LOG_INTERVAL_S = 5.0
 
 
 @dataclass
@@ -131,9 +142,17 @@ def _detect_loop_seconds(start_times_by_channel: dict[str, list[datetime]]) -> f
 # Duration-probe cache for measure_duration=True scans, keyed by resolved path
 # string -> (mtime_ns, size, ffprobe-measured duration_s). scan_video_dir()
 # never opens files for a plain (Normal) scan; this cost only applies to
-# Parking/Timelapse scans, and the cache keeps a re-scan from re-probing files
-# that haven't changed. Guarded the same way as gps_parser's _parse_cache,
-# since a periodic re-scan and a trigger-file re-scan could otherwise race.
+# Parking/Timelapse/Event scans, and the cache keeps a LATER re-scan from
+# re-probing files that haven't changed. A plain in-memory dict - NOT
+# persisted anywhere - so it only helps re-scans WITHIN this same running
+# process (DASHCAM_RESCAN_INTERVAL, the reload trigger file); it's empty
+# again after every process restart (a container rebuild/recreate, a
+# gunicorn worker respawn), and that first scan always re-probes everything
+# regardless of how recently a PREVIOUS process already measured those same
+# files - confirmed live 2026-10-15, not a bug (see _duration_cached's
+# docstring for the progress-line confusion this caused). Guarded the same
+# way as gps_parser's _parse_cache, since a periodic re-scan and a
+# trigger-file re-scan could otherwise race.
 _duration_cache: dict[str, tuple[int, int, float]] = {}
 _duration_cache_lock = threading.Lock()
 
@@ -154,6 +173,30 @@ def _probe_file_duration(path: Path) -> float | None:
         with _duration_cache_lock:
             _duration_cache[key] = (*sig, duration)
     return duration
+
+
+def _duration_cached(path: Path) -> bool:
+    """
+    True if path already has a valid (matching mtime+size) entry in
+    _duration_cache, without probing it if not - used only to report real
+    numbers in scan_video_dir's progress line ("N already cached, M to
+    probe"), since _duration_cache is a plain in-memory dict with NO
+    persistence across a process restart: it only helps a later re-scan
+    WITHIN the same running process (DASHCAM_RESCAN_INTERVAL, the reload
+    trigger), never across a container restart/rebuild. Confirmed live
+    2026-10-15: right after a rebuild, a scan of thousands of untouched
+    Parking files still probed every one of them - expected, not a bug
+    (cache is cold), but the progress line's wording made it read like the
+    cache should already be active, so this exists to make the count
+    honest instead.
+    """
+    try:
+        st = path.stat()
+    except OSError:
+        return False
+    with _duration_cache_lock:
+        cached = _duration_cache.get(str(path))
+    return bool(cached and cached[:2] == (st.st_mtime_ns, st.st_size))
 
 
 def scan_video_dir(
@@ -249,11 +292,43 @@ def scan_video_dir(
         next_start[seg.channel] = seg.start_time
 
     if measure_duration:
-        for seg in segments:
+        # This loop is the slow part of scanning a measure_duration directory
+        # (Parking, Event): it opens every file via ffprobe, one subprocess
+        # each. On a cold cache (a fresh container, or newly-arrived files)
+        # that's real wall-clock time with NO other feedback otherwise - the
+        # caller (app.py's _install_state/reload_state) only prints once the
+        # whole scan returns, and gunicorn's preload_app doesn't even start
+        # listening until that happens (see CLAUDE.md's "Docker" section) -
+        # so without this, the process looks hung/dead for however long the
+        # probe takes (confirmed live 2026-10-15: ~4 silent minutes for 3732
+        # real Parking files). Progress is logged on a timer
+        # (DURATION_PROBE_LOG_INTERVAL_S), not every N files, so a fully-
+        # cached re-scan - the common case once warm - doesn't spam the log.
+        total = len(segments)
+        label = directory.name
+        if total:
+            # Real counts, not a generic claim about caching - _duration_cache
+            # is per-process and empty on every fresh start (see
+            # _duration_cached's docstring), so saying "cached by mtime+size"
+            # without saying how many ACTUALLY are right now reads as a
+            # promise this particular run doesn't keep.
+            already_cached = sum(1 for seg in segments if _duration_cached(seg.path))
+            print(f"Probing real duration for {total} {label} file(s) via ffprobe "
+                  f"({already_cached} already cached from an earlier scan this process, "
+                  f"{total - already_cached} to probe now)...",
+                  flush=True)
+        started = time.monotonic()
+        last_logged = started
+        for i, seg in enumerate(segments, start=1):
             real_span_s = (seg.coverage_end() - seg.start_time).total_seconds()
             file_duration_s = _probe_file_duration(seg.path)
             if file_duration_s and real_span_s > 0:
                 seg.compression_ratio = file_duration_s / real_span_s
+            now = time.monotonic()
+            if i == total or now - last_logged >= DURATION_PROBE_LOG_INTERVAL_S:
+                print(f"  {label} duration probe: {i}/{total} files ({now - started:.1f}s elapsed)",
+                      flush=True)
+                last_logged = now
 
     return segments
 
@@ -269,3 +344,113 @@ def find_segments_for_timestamp(
         if seg.start_time <= ts < seg.coverage_end():
             result[seg.channel] = seg
     return result
+
+
+@dataclass
+class EventClip:
+    """
+    One channel's file from a motion/impact Event clip (mode "E", inside the
+    top-level Event/ directory). Deliberately NOT a VideoSegment: events are
+    sporadic and accelerometer-triggered (impact, at a configurable
+    sensitivity - not purely motion, and not parking-only: confirmed capable
+    of firing mid-drive too, e.g. hitting a pothole), not loop-recorded, so
+    the loop-length / coverage-window-capped-at-the-next-segment machinery
+    VideoSegment exists for (see scan_video_dir's docstring) doesn't apply -
+    there's no "next same-channel segment" to cap against.
+
+    duration_s (real, playable seconds - realtime, NOT a Timelapse-style
+    compression ratio) is set by scan_event_dir(measure_duration=True).
+    Confirmed via ffprobe against all 224 real files in one real Event/
+    directory (2026-10-15): most (151/224) are exactly 300.000000s, and the
+    rest range from ~21s to ~290s - the same truncation-on-early-stop
+    pattern already documented for Normal/Parking (ignition off mid-
+    recording, a camera restart, end of a session) rather than Timelapse's
+    variable-per-session compression interval. This supersedes an earlier,
+    unverified note in this docstring claiming "16.7s and 60s observed" -
+    that didn't hold up against the real data once it was actually measured.
+    0.0 (the default) means not yet measured.
+
+    Still NOT verified: exactly where within the file the real trigger
+    instant falls. The maintainer manually inspected one real clip
+    (2026-10-15) and reports the impact at ~60s in, with ~4 more minutes
+    recorded after - consistent with the common 300s duration above (a
+    1-minute pre-roll + 4-minute post-roll buffer) but confirmed against
+    only that one clip, not measured from the camera's own burned-in
+    timestamp the way Timelapse's compression_ratio was before it was
+    trusted. app.py's DASHCAM_EVENT_TRIGGER_OFFSET_S (default 60s) treats
+    this as a tunable estimate, not a verified constant - don't harden
+    assumptions around it without checking more real clips first.
+
+    coverage_end() (added once duration_s existed to measure it with) makes
+    an EventClip's real recorded window - [start_time, coverage_end()) -
+    usable with find_segments_for_timestamp() exactly like a VideoSegment's,
+    so clicking ANYWHERE along the map path within that window (not just the
+    marker, which always dispatches start_time itself) resolves to this
+    clip, seeked to the right real-time offset (confirmed live 2026-10-15:
+    clicking a point partway through an Event's halo on the map previously
+    hit "no video found", since app.py's /api/videos only matched an exact
+    `ts == start_time`, never any instant *within* the clip). Realtime, not
+    capped: NO "next same-channel segment" clamp the way VideoSegment's
+    coverage_end() has, since Events are discrete, independent clips, not
+    samples from a continuous loop - just start_time + the file's own
+    measured duration_s. A clip with duration_s still 0 (unmeasured)
+    produces an empty window (coverage_end() == start_time), so it matches
+    nothing here rather than being guessed as covering anything.
+    """
+    path: Path
+    start_time: datetime   # UTC, tz-aware - this file's own recording start
+    channel: str
+    duration_s: float = 0.0
+
+    def coverage_end(self) -> datetime:
+        return self.start_time + timedelta(seconds=self.duration_s)
+
+
+def scan_event_dir(
+    directory: str | Path, record_tz: ZoneInfo, *, measure_duration: bool = False
+) -> list[EventClip]:
+    """
+    Scan directory (the top-level Event/ dir) for motion/impact Event clips
+    (mode "E") and parse their start times - same filename shape and
+    record_tz localization as scan_video_dir, but none of its loop-length
+    detection or coverage-window capping, which assume continuous loop
+    recording (see EventClip's docstring for why that doesn't apply here).
+
+    measure_duration additionally ffprobes each file's real playable
+    duration via the same cached _probe_file_duration() Parking/Timelapse
+    scans use (keyed by (mtime_ns, size), so a re-scan only re-probes files
+    that changed) - cheap here since an Event/ directory is typically a few
+    hundred files, nowhere near Parking's scale. Grouping same-moment
+    multi-channel files together, and locating them on the map via the
+    nearest GPS fix, is app.py's job.
+    """
+    directory = Path(directory)
+    pattern = _filename_pattern("E")
+    # Just a start/end bracket, not a per-file heartbeat like scan_video_dir's
+    # measure_duration loop below - an Event/ directory is typically a few
+    # hundred files (ffprobed inline in the loop below when measure_duration),
+    # nowhere near the multi-minute Parking case that loop's progress lines
+    # exist for, so there's no real silent gap here to fill in. Deliberately
+    # says nothing about caching (unlike that loop's header) rather than
+    # guessing a hit/miss count without actually checking one - see
+    # _duration_cached's docstring for why an unchecked claim about caching
+    # here would risk the same confusion.
+    if measure_duration:
+        print(f"Scanning {directory.name}/ (ffprobing each file for real duration)...", flush=True)
+    started = time.monotonic()
+    clips = []
+    for path in directory.iterdir():
+        m = pattern.match(path.name)
+        if not m:
+            continue
+        dt_local = datetime.strptime(
+            m.group("date") + m.group("time"), "%Y%m%d%H%M%S"
+        ).replace(tzinfo=record_tz)
+        dt_utc = dt_local.astimezone(timezone.utc)
+        channel = CHANNEL_MAP.get(m.group("channel").upper(), m.group("channel"))
+        duration_s = (_probe_file_duration(path) or 0.0) if measure_duration else 0.0
+        clips.append(EventClip(path, dt_utc, channel, duration_s))
+    clips.sort(key=lambda c: c.start_time)
+    if measure_duration:
+        print(f"  {directory.name} scan: {len(clips)} clips in {time.monotonic() - started:.1f}s", flush=True)
+    return clips

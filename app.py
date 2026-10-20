@@ -31,7 +31,7 @@ import config
 import gps_parser
 import video_transcode
 from gps_parser import load_gps_dir
-from video_matcher import scan_video_dir, find_segments_for_timestamp, FILENAME_PATTERN
+from video_matcher import scan_video_dir, scan_event_dir, find_segments_for_timestamp
 
 app = Flask(__name__)
 
@@ -45,9 +45,12 @@ STATE = {
     "video_segments": [],
     "video_dir": None,
     "parking_segments": [],      # Parking-mode Timelapse ("T") segments, [] if Parking/ absent
+    "event_clips": [],           # Motion/impact Event ("E") clips, [] if Event/ absent
+    "events_by_start": {},       # start_time -> {channel: EventClip}, for /api/videos's exact-match lookup
     "display_tz": None,
-    "segments_by_channel": {},   # channel -> that channel's Normal segments, time-sorted
-    "segment_by_filename": {},   # e.g. "20260904_182500_00002_N_A.MP4" -> VideoSegment; both Normal + Parking
+    "prefetch_by_channel": {},   # channel -> Normal+Parking+Event, time-sorted, for _prefetch_neighbors
+    "channels_by_start": {},     # start_time -> {channel, ...} across Normal+Parking+Event, same use
+    "segment_by_filename": {},   # e.g. "20260904_182500_00002_N_A.MP4" -> VideoSegment; Normal + Parking + Event
     "loaded_at": None,
     "_data_dir": None,           # kept so reload_state() can rebuild with the same config
     "_record_tz": None,
@@ -173,6 +176,25 @@ def _stop_max_speed_mph() -> float:
     return max(mph, 0.0)
 
 
+def _event_trigger_offset_s() -> float:
+    """
+    Seconds into an Event clip's own file where the real accelerometer
+    trigger happens - not the file's start. Tunable rather than hardcoded
+    because it's an estimate, not a verified constant: see EventClip's
+    docstring in video_matcher.py for the single real clip this was measured
+    from (maintainer manually inspected one file, 2026-10-15 - ~1 minute of
+    pre-roll before impact, ~4 more minutes after). Clamped against each
+    event's own measured duration_s by its caller (_event_json/api_events)
+    so a severely truncated clip (observed as short as ~21s - see
+    EventClip's docstring) never produces a "trigger" instant past the
+    file's own real end.
+    """
+    try:
+        return max(float(os.environ.get("DASHCAM_EVENT_TRIGGER_OFFSET_S", "60")), 0.0)
+    except ValueError:
+        return 60.0
+
+
 def _detect_stationary_stops(fixes, min_duration_s: float, max_speed_mph: float):
     """
     Find runs of consecutive fixes (from a time-sorted list) whose speed never
@@ -244,6 +266,39 @@ def _stop_json(start_utc, end_utc, lat, lon, tz, *, video_start_utc=None, video_
 def _count_overlapping_segments(start, end, segments) -> int:
     """Count of segments (any channel/source) whose [start_time, coverage_end()) overlaps [start, end)."""
     return sum(1 for s in segments if s.start_time < end and s.coverage_end() > start)
+
+
+def _event_json(video_start_utc, trigger_utc, video_end_utc, channels, lat, lon, tz) -> dict:
+    d = {
+        # The real (estimated) trigger instant - see _event_trigger_offset_s
+        # - used for display, the map marker's position, and the location
+        # lookup (_last_fix_at_or_before) that produced lat/lon: at highway
+        # speed, the vehicle can be meaningfully far from where it was a
+        # full minute earlier (video_start), so using the trigger instant
+        # here instead of the file's own start matters for accuracy, not
+        # just cosmetics.
+        "start": trigger_utc.isoformat(),
+        "start_local": trigger_utc.astimezone(tz).isoformat(),
+        "lat": lat,
+        "lon": lon,
+        "channels": sorted(channels),
+        # The clip's own file start - what selectEvent() actually dispatches
+        # as point.t so the clip opens from its own beginning (showing the
+        # pre-roll), same video_start/video_start_local naming convention
+        # _stop_json uses for the same "displayed instant differs from the
+        # best video-loading instant" reason.
+        "video_start": video_start_utc.isoformat(),
+        "video_start_local": video_start_utc.astimezone(tz).isoformat(),
+    }
+    if video_end_utc is not None:
+        # The clip's own real end (video_start + measured duration_s) - the
+        # frontend's halo overlay on the map path, and findEventContaining(),
+        # both use [video_start, video_end) as the event's full recorded
+        # window. Absent when duration_s couldn't be measured for any
+        # channel of this event.
+        d["video_end"] = video_end_utc.isoformat()
+        d["video_end_local"] = video_end_utc.astimezone(tz).isoformat()
+    return d
 
 
 def _first_parking_start_within(start_utc, end_utc):
@@ -380,6 +435,73 @@ def api_stops():
     return jsonify(stops)
 
 
+@app.route("/api/events")
+def api_events():
+    """
+    Return motion/impact Event clips (STATE["event_clips"], from the
+    top-level Event/ directory - see video_matcher.scan_event_dir) for
+    ?date=YYYY-MM-DD (display timezone, same convention as /api/stops;
+    omitted returns every day's).
+
+    One entry per distinct recording moment, not per channel's file -
+    same-moment files across channels share an identical start_time (same
+    convention a Parking chunk uses - see api_segment_boundary's docstring),
+    so grouping by that timestamp (STATE["events_by_start"]) naturally merges
+    a multi-channel event into one marker.
+
+    Location is backfilled from the TRIGGER instant (video_start +
+    _event_trigger_offset_s, clamped to the event's own measured duration -
+    see below), not the file's own start - at highway speed the vehicle can
+    be meaningfully far from where it was a full minute earlier, so using
+    the file's start here would misplace the marker for exactly the
+    mid-drive case (a pothole, a hard brake) this feature was clarified to
+    handle. _last_fix_at_or_before also covers the parked case (a motion
+    event can fire with GPS not actively logging), same reasoning /api/stops
+    uses for a Parking clip. An event with no GPS history at all yet
+    (nothing before it) is skipped rather than guessing a location.
+
+    Deliberately NOT merged with /api/stops or shown as a video_count on a
+    stop the way Parking clips are: an Event is its own kind of thing (a
+    motion/impact trigger, not a span of non-movement), and the frontend
+    marks it distinctly (see templates/index.html).
+
+    Clicking an event (see the frontend's selectEvent()) plays its clip(s)
+    from the start (offset 0, via `video_start`/`video_start_local`) rather
+    than seeking to the trigger instant - the pre-roll leading up to the
+    impact is exactly the point of a buffer-style Event recording, so the
+    file's own beginning is the right place to open it. `video_end`/
+    `video_end_local` (video_start + the event's measured duration_s, the
+    max across its channels - absent if no channel's duration was
+    measurable) give the frontend the clip's real recorded window, used for
+    both the map-path halo overlay and findEventContaining() (see
+    templates/index.html) - NOT for any seek-offset math within the clip,
+    which still isn't written against the unverified trigger-offset
+    assumption (see EventClip's docstring in video_matcher.py).
+    """
+    tz = STATE["display_tz"]
+    date_raw = request.args.get("date")
+    trigger_offset_s = _event_trigger_offset_s()
+
+    events = []
+    for video_start_utc, by_channel in STATE["events_by_start"].items():
+        if date_raw and _local_date(video_start_utc, tz) != date_raw:
+            continue
+        durations = [c.duration_s for c in by_channel.values() if c.duration_s > 0]
+        duration_s = max(durations) if durations else None
+        offset_s = min(trigger_offset_s, duration_s) if duration_s is not None else trigger_offset_s
+        trigger_utc = video_start_utc + timedelta(seconds=offset_s)
+        video_end_utc = video_start_utc + timedelta(seconds=duration_s) if duration_s is not None else None
+        loc_fix = _last_fix_at_or_before(trigger_utc)
+        if loc_fix is None:
+            continue  # no GPS history at all yet before this clip - skip rather than guess a location
+        events.append(_event_json(
+            video_start_utc, trigger_utc, video_end_utc, by_channel.keys(), loc_fix.lat, loc_fix.lon, tz,
+        ))
+
+    events.sort(key=lambda e: e["start"])
+    return jsonify(events)
+
+
 @app.route("/api/coverage")
 def api_coverage():
     """
@@ -390,28 +512,42 @@ def api_coverage():
     trigger a real transcode) just to find out.
 
     Merges (start_time, coverage_end()) windows from STATE["video_segments"]
-    (Normal) and STATE["parking_segments"] (Parking/Timelapse), any channel
-    counts as covered. Pure metadata; never touches video_transcode. Unlike
-    /api/track's/api/stops's date filter (a point test on each fix's own local
-    date), segments are SPANS, so filtering is by day-window overlap
-    (_day_bounds_utc), not the segment's start_time's local date alone. date
-    must be well-formed if given (400 on a bad value), since this endpoint
-    actually has to parse it to compute day bounds (unlike those two routes).
+    (Normal), STATE["parking_segments"] (Parking/Timelapse), and
+    STATE["event_clips"] with a measured duration (see EventClip.coverage_end()
+    in video_matcher.py - any channel/source counts as covered. An Event clip
+    has real footage for its own recorded window same as anything else, so
+    that span should read as covered, not as a gap, even though it's also
+    drawn with the separate red halo overlay (see templates/index.html)
+    marking it as an Event specifically - the two are not mutually exclusive:
+    "is there footage" and "is some of it an Event" are different questions.
+    A clip whose duration couldn't be measured (duration_s == 0, e.g. a probe
+    failure) has coverage_end() == start_time - an empty window - so it's
+    naturally excluded rather than assumed covered. Pure metadata; never
+    touches video_transcode. Unlike /api/track's/api/stops's date filter (a
+    point test on each fix's own local date), these are all SPANS, so
+    filtering is by day-window overlap (_day_bounds_utc), not start_time's
+    local date alone. date must be well-formed if given (400 on a bad
+    value), since this endpoint actually has to parse it to compute day
+    bounds (unlike those two routes).
 
     Returns [{"start": ..., "end": ...}, ...] (UTC ISO), sorted, non-overlapping.
     """
     tz = STATE["display_tz"]
     date_raw = request.args.get("date")
-    segments = STATE["video_segments"] + STATE["parking_segments"]
+    intervals = [
+        (s.start_time, s.coverage_end())
+        for s in STATE["video_segments"] + STATE["parking_segments"] + STATE["event_clips"]
+        if s.coverage_end() > s.start_time
+    ]
 
     if date_raw:
         try:
             day_start, day_end = _day_bounds_utc(date_raw, tz)
         except ValueError:
             return jsonify({"error": "invalid date format, expected YYYY-MM-DD"}), 400
-        segments = [s for s in segments if s.start_time < day_end and s.coverage_end() > day_start]
+        intervals = [(start, end) for start, end in intervals if start < day_end and end > day_start]
 
-    merged = _merge_coverage_intervals([(s.start_time, s.coverage_end()) for s in segments])
+    merged = _merge_coverage_intervals(intervals)
     return jsonify([{"start": start.isoformat(), "end": end.isoformat()} for start, end in merged])
 
 
@@ -465,9 +601,19 @@ def api_videos():
     Given ?ts=<ISO timestamp, UTC>, return the video segment(s) covering that
     moment, one per channel, with the seek offset (seconds into the file)
     needed to land exactly on that timestamp. Checks Normal segments first,
-    then Parking/Timelapse for any channel Normal didn't cover - the frontend
-    doesn't need to know or care which source a given moment's footage came
-    from, it's the same click-to-load flow either way.
+    then Parking/Timelapse for any channel Normal didn't cover, then an Event
+    clip whose own real recorded window ([start_time, coverage_end()), see
+    EventClip.coverage_end() - realtime, no next-segment cap, just the file's
+    measured duration_s) covers ts - the frontend doesn't need to know or
+    care which source a given moment's footage came from, it's the same
+    click-to-load flow either way, and clicking ANYWHERE along the map's
+    red Event-halo now resolves to the right instant in the clip, not just
+    its own start_time. (Fixed 2026-10-15: this used to be an exact-equality
+    check against start_time only, reachable only via the marker/sidebar row
+    - clicking any OTHER point within the halo, which the halo itself
+    visually invites, hit "no video found" even though the Event clip's file
+    genuinely covered that instant. EventClip didn't have a real
+    coverage_end() to check against until duration_s was actually measured.)
     """
     ts_raw = request.args.get("ts")
     if not ts_raw:
@@ -483,15 +629,23 @@ def api_videos():
     if STATE["parking_segments"]:
         for channel, seg in find_segments_for_timestamp(STATE["parking_segments"], ts).items():
             matches.setdefault(channel, seg)  # Normal wins if both somehow cover the same instant
+    if STATE["event_clips"]:
+        for channel, seg in find_segments_for_timestamp(STATE["event_clips"], ts).items():
+            matches.setdefault(channel, seg)  # Normal/Parking win over an Event covering the same instant
 
     pending = _read_pending_deletes()
     result = {}
     for channel, seg in matches.items():
-        # compression_ratio is 1.0 for realtime (Normal) segments, so this is
-        # the same formula as before for them; for Parking/Timelapse it
-        # translates "N real seconds into the segment" into "N * ratio seconds
-        # into the file" - see VideoSegment.compression_ratio.
-        offset = (ts - seg.start_time).total_seconds() * seg.compression_ratio
+        # compression_ratio is 1.0 for realtime (Normal, Event) segments, so
+        # this is the same formula as before for them; for Parking/Timelapse
+        # it translates "N real seconds into the segment" into "N * ratio
+        # seconds into the file" - see VideoSegment.compression_ratio.
+        # EventClip has no compression_ratio field at all (it's realtime by
+        # definition, never a Timelapse-style ratio - see its docstring), so
+        # this defaults it to 1.0 via getattr rather than giving it one just
+        # for this one call site.
+        ratio = getattr(seg, "compression_ratio", 1.0)
+        offset = (ts - seg.start_time).total_seconds() * ratio
         result[channel] = {
             "filename": seg.path.name,
             "url": f"/video/{seg.path.name}",
@@ -500,6 +654,7 @@ def api_videos():
             "end_time": seg.coverage_end().isoformat(),
             "pending_delete": _relative_video_path(seg) in pending,
         }
+
     return jsonify(result)
 
 
@@ -740,11 +895,11 @@ def serve_original(filename):
 # the live edge, so re-counting there is wanted.
 _served_files: set[str] = set()
 
-# group key -> channels of that recording moment already counted as served.
-# A "group" is every channel's file from one recording moment (see
-# _segment_group_key) - popped once it's complete, so this only ever holds
-# in-progress groups.
-_group_progress: dict[str, set[str]] = defaultdict(set)
+# start_time -> channels of that recording moment already counted as served.
+# A "group" is every channel's file from one recording moment - see
+# STATE["channels_by_start"] in _prefetch_neighbors - popped once it's
+# complete, so this only ever holds in-progress groups.
+_group_progress: dict[datetime, set[str]] = defaultdict(set)
 _group_progress_lock = threading.Lock()
 
 # Segments we've already kicked off next-segment prefetch for, so a burst of
@@ -755,25 +910,28 @@ _group_progress_lock = threading.Lock()
 _prefetched_from: set[str] = set()
 
 
-def _segment_group_key(seg) -> str | None:
-    """
-    Id shared by every channel's file from the same recording moment -
-    derived from the filename's date/time/seq, which the camera writes
-    identically across channels and only the trailing channel letter
-    distinguishes. None for a filename that doesn't match the Normal-mode
-    pattern (prefetch only supports Normal segments - see _prefetch_neighbors).
-    """
-    m = FILENAME_PATTERN.match(seg.path.name)
-    return f"{m.group('date')}_{m.group('time')}_{m.group('seq')}" if m else None
-
-
 def _prefetch_neighbors(seg):
     """
     Once every channel of the CURRENT recording moment ("set") has finished
     its own on-demand transcode, kick off background transcoding of each of
-    those channels' single NEXT same-channel segment - so auto-advancing to
-    the next segment (or scrubbing forward) doesn't re-hit the ~1 minute
-    first-view wait. Fires in daemon threads and doesn't block the response.
+    those channels' single NEXT recording for that channel - so auto-
+    advancing to the next segment (or scrubbing forward) doesn't re-hit the
+    ~1 minute first-view wait. Fires in daemon threads and doesn't block the
+    response.
+
+    Source-agnostic as of 2026-10-16: looks up siblings via
+    STATE["prefetch_by_channel"], one combined time-sorted list per channel
+    spanning Normal + Parking + Event, and groups a moment's channels via
+    STATE["channels_by_start"] (also combined) - grouped by exact start_time
+    equality, not a filename pattern, since every source writes identical
+    start_time across a moment's channels (confirmed for Parking and Event
+    too - see api_segment_boundary's docstring). Previously only looked at
+    Normal segments (a Normal-only "segments_by_channel" plus a Normal-only
+    filename-pattern grouping key), so a Parking or Event clip's own next
+    neighbor - which could easily BE a Normal segment, or vice versa, since
+    "next" here means strictly chronological-for-that-channel, not
+    same-source - never got warmed: confirmed live, in two separate reports,
+    for Parking (2026-09-15) and Event (2026-10-16).
 
     Previously fired per-channel, independently, the instant that one
     channel's own transcode finished, and warmed both the next AND previous
@@ -789,11 +947,6 @@ def _prefetch_neighbors(seg):
     transcoded gets warmed, but one whose cached file is corrupt is only
     evicted, not rebuilt - that waits until the file is actually requested for
     playback.
-
-    Only looks at STATE["segments_by_channel"] (Normal) - _segment_group_key
-    returns None for anything else, so a Parking/Timelapse `seg` is still a
-    silent no-op here, same limitation as before - the clip itself still
-    serves fine, it just doesn't get neighbor-prefetch warming.
 
     Skips a neighbor that's already in pending_deletes.txt - marking a file
     for deletion doesn't remove it from disk (the maintainer does that by
@@ -813,25 +966,20 @@ def _prefetch_neighbors(seg):
         return
     _served_files.add(seg.path.name)
 
-    group_key = _segment_group_key(seg)
-    if group_key is None:
-        return
+    group_key = seg.start_time
 
     with _group_progress_lock:
         served = _group_progress[group_key]
         served.add(seg.channel)
-        group_channels = {
-            channel for channel, segs in STATE["segments_by_channel"].items()
-            if any(_segment_group_key(s) == group_key for s in segs)
-        }
+        group_channels = STATE["channels_by_start"].get(group_key, set())
         if not group_channels or not group_channels <= served:
             return
         del _group_progress[group_key]
 
     pending = _read_pending_deletes()
     for channel in group_channels:
-        siblings = STATE["segments_by_channel"].get(channel, [])
-        current = next((s for s in siblings if _segment_group_key(s) == group_key), None)
+        siblings = STATE["prefetch_by_channel"].get(channel, [])
+        current = next((s for s in siblings if s.start_time == group_key), None)
         if current is None or current.path.name in _prefetched_from:
             continue
         idx = siblings.index(current)
@@ -897,6 +1045,25 @@ def _build_state(data_dir: Path, record_tz: ZoneInfo, display_tz: ZoneInfo) -> d
     power, or an older setup). Kept in a separate segments list from Normal's,
     per video_matcher's warning that Timelapse's per-session-variable cadence
     would poison Normal's loop-length median if scanned together.
+
+    Event/ (motion/impact clips, mode "E") is scanned too, also optionally,
+    via scan_event_dir rather than scan_video_dir - see EventClip's docstring
+    for why Events don't fit VideoSegment's loop-recording model at all. Only
+    the top-level Event/ directory; _E_ files inside Parking/ are a separate,
+    still-unhandled case (see CLAUDE.md's "Possible future work").
+
+    Prints a start/elapsed line around each phase below (GPS parse, each
+    directory scan) - added 2026-10-15 because this whole function runs with
+    ZERO other log output before it returns (the caller, _install_state() /
+    reload_state(), only prints once it has the finished result), and with
+    preload_app=True gunicorn doesn't even start listening until this
+    returns either (see CLAUDE.md's "Docker" section) - so a slow data dir
+    (millions of GPS fixes, thousands of Parking files) otherwise looks
+    hung/dead for however long it actually takes, with no way to tell "still
+    working" from "stuck". scan_video_dir's own measure_duration loop prints
+    its own finer-grained progress for the genuinely slow part (ffprobing
+    every Parking/Event file); these are the coarser, phase-level markers
+    around it and the other (fast) steps.
     """
     gps_dir = data_dir / "GPS"
     video_dir = data_dir / "Normal"
@@ -904,33 +1071,82 @@ def _build_state(data_dir: Path, record_tz: ZoneInfo, display_tz: ZoneInfo) -> d
         if not required.is_dir():
             raise FileNotFoundError(f"Expected directory not found: {required}")
 
+    started = time.monotonic()
+    print(f"Loading GPS data from {gps_dir}...", flush=True)
     fixes = load_gps_dir(gps_dir, record_tz=record_tz)
+    print(f"  loaded {len(fixes)} GPS fixes ({time.monotonic() - started:.1f}s elapsed)", flush=True)
+
+    print(f"Scanning {video_dir}...", flush=True)
+    t = time.monotonic()
     segments = scan_video_dir(video_dir, record_tz=record_tz)
+    print(f"  found {len(segments)} Normal segments ({time.monotonic() - t:.1f}s elapsed)", flush=True)
 
     parking_dir = data_dir / "Parking"
     parking_segments = []
     if parking_dir.is_dir():
+        t = time.monotonic()
         parking_segments = scan_video_dir(
             parking_dir, record_tz=record_tz, mode="T",
             measure_duration=True, extend_to_next=True,
         )
+        print(f"  found {len(parking_segments)} Parking segments ({time.monotonic() - t:.1f}s elapsed)",
+              flush=True)
 
-    by_channel = defaultdict(list)
-    for seg in segments:  # already time-sorted, so each per-channel list stays time-sorted too
-        by_channel[seg.channel].append(seg)
+    event_dir = data_dir / "Event"
+    event_clips = []
+    if event_dir.is_dir():
+        # measure_duration=True so each clip's real duration is known for
+        # _event_trigger_offset_s's clamp and the frontend's map-path halo -
+        # cheap here (an Event/ directory is typically a few hundred files,
+        # nowhere near Parking's scale - see scan_event_dir's docstring).
+        event_clips = scan_event_dir(event_dir, record_tz, measure_duration=True)
+
+    print(f"_build_state() done ({time.monotonic() - started:.1f}s total)", flush=True)
+
+    # Same-moment Event files across channels share an identical start_time
+    # (same convention as a Parking chunk - see api_segment_boundary's
+    # docstring), so grouping by that timestamp gives one entry per channel
+    # for /api/videos's exact-match lookup (see EventClip's docstring for why
+    # Events are looked up by exact timestamp rather than a coverage window).
+    events_by_start = defaultdict(dict)
+    for clip in event_clips:
+        events_by_start[clip.start_time][clip.channel] = clip
+
+    # One combined, time-sorted per-channel list spanning every source
+    # (Normal, Parking, Event) - and a start_time -> {channels present}
+    # lookup alongside it - for _prefetch_neighbors to find "the next
+    # recording for this channel" and "which channels make up this moment"
+    # without caring which directory/mode any of them came from. Built here
+    # rather than per-source (there used to be a Normal-only
+    # "segments_by_channel") because the real gap this fixes - confirmed
+    # live 2026-10-15/16 for both Parking and Event - was prefetch logic
+    # that only ever looked at Normal, so a Parking or Event clip's own next
+    # neighbor (which could easily BE a Normal segment, or vice versa) never
+    # got warmed at all.
+    prefetch_by_channel = defaultdict(list)
+    channels_by_start = defaultdict(set)
+    for item in segments + parking_segments + event_clips:
+        prefetch_by_channel[item.channel].append(item)
+        channels_by_start[item.start_time].add(item.channel)
+    for lst in prefetch_by_channel.values():
+        lst.sort(key=lambda s: s.start_time)
 
     # Filenames are unique across every recording mode/directory, so one
     # combined lookup serves both /video and /original regardless of source.
     segment_by_filename = {seg.path.name: seg for seg in segments}
     segment_by_filename.update((seg.path.name, seg) for seg in parking_segments)
+    segment_by_filename.update((clip.path.name, clip) for clip in event_clips)
 
     return {
         "fixes": fixes,
         "video_segments": segments,
         "video_dir": str(video_dir),
         "parking_segments": parking_segments,
+        "event_clips": event_clips,
+        "events_by_start": dict(events_by_start),
         "display_tz": display_tz,
-        "segments_by_channel": dict(by_channel),
+        "prefetch_by_channel": dict(prefetch_by_channel),
+        "channels_by_start": dict(channels_by_start),
         "segment_by_filename": segment_by_filename,
         "loaded_at": datetime.now(timezone.utc),
         "_data_dir": data_dir,
@@ -946,8 +1162,9 @@ def _install_state(data_dir: Path, record_tz: ZoneInfo, display_tz: ZoneInfo) ->
     except FileNotFoundError as e:
         sys.exit(str(e))
     parking_note = f", {len(STATE['parking_segments'])} parking clips" if STATE["parking_segments"] else ""
+    event_note = f", {len(STATE['event_clips'])} event clips" if STATE["event_clips"] else ""
     print(f"Loaded {len(STATE['fixes'])} GPS fixes, {len(STATE['video_segments'])} "
-          f"video segments{parking_note} from {data_dir}")
+          f"video segments{parking_note}{event_note} from {data_dir}")
     print(f"Transcoder: {video_transcode.encoder_summary()}")
     if STATE["fixes"] and not STATE["video_segments"]:
         print("WARNING: no video segments matched - check video_matcher.py's "

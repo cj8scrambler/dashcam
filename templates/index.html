@@ -70,6 +70,31 @@
     }
     .stop-marker-wrap.active .stop-marker-icon { background: #2b6cff; }
 
+    /* "Events" - motion/impact clips from the top-level Event/ directory
+       (see video_matcher.scan_event_dir / app.py's /api/events). Same
+       sidebar-list-plus-map-marker shape as "Stops" above, but visually
+       distinct: events are a different KIND of thing (a motion/impact
+       trigger, not a span of non-movement) and the two are never merged. */
+    #events { border-bottom: 1px solid #2a2d36; }
+    #events-header { padding: 8px 10px 4px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: #6b7280; }
+    #events-list { max-height: 160px; overflow-y: auto; }
+    .event-row { display: flex; justify-content: space-between; gap: 8px; padding: 6px 10px; font-size: 12px; cursor: pointer; color: #c3c8d4; }
+    .event-row:hover { background: #232838; }
+    .event-row.active { background: #2b6cff; color: #fff; }
+    .event-row-channels { color: #9aa2b1; }
+    .event-row.active .event-row-channels { color: #dbe4ff; }
+
+    /* Map marker for an event - a diamond (rotated square), vs. the stop
+       marker's upright square, and red rather than orange, so the two read
+       as distinct kinds of marker at a glance even at small map zoom levels
+       where color alone might not. */
+    .event-marker-wrap { background: none !important; border: none !important; }
+    .event-marker-icon {
+      width: 11px; height: 11px; margin: 2.5px; background: #ef4444; border: 2px solid #fff;
+      box-shadow: 0 0 4px rgba(0,0,0,0.6); transform: rotate(45deg);
+    }
+    .event-marker-wrap.active .event-marker-icon { background: #2b6cff; }
+
     /* Scrubber for moving through a stop's time window - anchored to the
        bottom of the map square (#map-pane), the app's existing general-
        purpose control for navigating between videos, rather than floating
@@ -181,6 +206,28 @@
       padding: 1px 6px; font-size: 10px; text-transform: none; letter-spacing: normal;
     }
 
+    /* Shown on the currently-loaded video block(s) when the loaded instant
+       falls within a known Event's recorded window (see
+       findEventContaining() in onPointClick) - REGARDLESS of which file is
+       actually playing. An accelerometer-
+       triggered Event can fire mid-drive (a pothole, a hard brake), not just
+       while parked, so the footage shown is very often ordinary Normal video
+       for that moment, not the separate Event file itself (see
+       EventClip's docstring in video_matcher.py for why Normal always wins
+       that match when both cover the same instant) - without this, that
+       looks exactly like any other ordinary moment with no way to tell an
+       impact was flagged here. Same red (#ef4444) as the event map marker,
+       for the same "distinct kind of thing from a stop/ordinary video" read
+       the marker's color was chosen for. The badge carries that signal in
+       text too, not just color/glow, for anyone who can't rely on color. */
+    .video-block.event-highlight {
+      box-shadow: 0 0 0 3px #ef4444, 0 0 14px 2px rgba(239, 68, 68, 0.55);
+    }
+    .event-badge {
+      color: #fff; background: #ef4444; border: 1px solid #ef4444; border-radius: 4px;
+      padding: 1px 6px; font-size: 10px; text-transform: none; letter-spacing: normal; font-weight: 600;
+    }
+
     /*
      * Theater mode is a 2x2 grid with FIXED corners regardless of which
      * channels are actually present that day: front top-left, rear top-right,
@@ -206,6 +253,7 @@
     }
     #layout.theater #calendar,
     #layout.theater #stops,
+    #layout.theater #events,
     #layout.theater #info,
     #layout.theater #signout { display: none; }
     #layout.theater #side,
@@ -282,6 +330,10 @@
       <div id="stops">
         <div id="stops-header">Stops</div>
         <div id="stops-list"></div>
+      </div>
+      <div id="events">
+        <div id="events-header">Events</div>
+        <div id="events-list"></div>
       </div>
       <button id="theater-exit">&larr; Back to map</button>
       <div id="videos"><div class="empty-msg">Select a day with data, then click a point on the track.</div></div>
@@ -374,6 +426,19 @@ let activeStopIndex = -1;
 const STOP_ICON = L.divIcon({ className: 'stop-marker-wrap', html: '<div class="stop-marker-icon"></div>', iconSize: [16, 16] });
 const STOP_ICON_ACTIVE = L.divIcon({ className: 'stop-marker-wrap active', html: '<div class="stop-marker-icon"></div>', iconSize: [16, 16] });
 
+// "Events" - motion/impact clips from the top-level Event/ directory (see
+// /api/events in app.py). Same marker+sidebar-list shape as "Stops" above
+// (events[i]._marker/_row set by render*() below, reused across re-renders),
+// but a separate list: an event is a different kind of thing from a stop
+// (a motion/impact trigger, not a span of non-movement) and the two sources
+// are never merged - see api_events's docstring in app.py.
+let events = [];
+let eventsLayer = L.layerGroup().addTo(map);
+let activeEventIndex = -1;
+
+const EVENT_ICON = L.divIcon({ className: 'event-marker-wrap', html: '<div class="event-marker-icon"></div>', iconSize: [16, 16] });
+const EVENT_ICON_ACTIVE = L.divIcon({ className: 'event-marker-wrap active', html: '<div class="event-marker-icon"></div>', iconSize: [16, 16] });
+
 function formatLocalClock(iso) {
   // iso is a *_local field: an ISO string already rendered in the display
   // timezone by the backend. Pull the wall-clock digits out with a string
@@ -438,6 +503,25 @@ function findStopContaining(t) {
   return -1;
 }
 
+// The event (index into `events`) whose own recorded file window
+// [video_start, video_end) contains UTC ISO timestamp t, or -1. A
+// containment test like findStopContaining, NOT an exact-instant match on
+// the trigger (`start`) - an Event's accelerometer trigger can fire
+// anywhere within a ~5-minute buffered recording (see EventClip's
+// docstring), and ANY point within that whole recorded window should read
+// as "this is an Event", whichever file (the Event clip itself, or
+// overlapping Normal footage) is actually playing. Falls back to an exact
+// match on video_start alone when video_end is missing (duration couldn't
+// be measured for any channel - see api_events's docstring).
+function findEventContaining(t) {
+  const ms = Date.parse(t);
+  return events.findIndex(ev => {
+    const startMs = Date.parse(ev.video_start);
+    if (ev.video_end == null) return ms === startMs;
+    return ms >= startMs && ms < Date.parse(ev.video_end);
+  });
+}
+
 function renderStopsList() {
   const list = document.getElementById('stops-list');
   const section = document.getElementById('stops');
@@ -498,6 +582,65 @@ function selectStop(i, { autoplay = false } = {}) {
   const point = {
     t: stop.video_start || stop.start, t_local: stop.video_start_local || stop.start_local,
     lat: stop.lat, lon: stop.lon,
+    speed_mph: 0, speed_kmh: 0, alt_m: 0,
+  };
+  onPointClick(point, { autoplay });
+}
+
+function renderEventsList() {
+  const list = document.getElementById('events-list');
+  const section = document.getElementById('events');
+  list.innerHTML = '';
+  section.style.display = events.length === 0 ? 'none' : '';
+  events.forEach((ev, i) => {
+    const row = document.createElement('div');
+    row.className = 'event-row' + (i === activeEventIndex ? ' active' : '');
+    row.innerHTML = `<span>${formatLocalClock(ev.start_local)}</span>` +
+      `<span class="event-row-channels">${ev.channels.join(', ')}</span>`;
+    row.addEventListener('click', () => selectEvent(i));
+    list.appendChild(row);
+    ev._row = row;
+  });
+}
+
+function renderEventMarkers() {
+  eventsLayer.clearLayers();
+  events.forEach((ev, i) => {
+    const marker = L.marker([ev.lat, ev.lon], { icon: i === activeEventIndex ? EVENT_ICON_ACTIVE : EVENT_ICON })
+      .addTo(eventsLayer)
+      .bindTooltip(`Event: ${formatLocalClock(ev.start_local)}`, { direction: 'top', offset: [0, -10] });
+    marker.on('click', () => selectEvent(i));
+    ev._marker = marker;
+  });
+}
+
+function markActiveEventMarker() {
+  events.forEach((ev, idx) => {
+    if (ev._marker) ev._marker.setIcon(idx === activeEventIndex ? EVENT_ICON_ACTIVE : EVENT_ICON);
+  });
+}
+
+function setActiveEvent(idx) {
+  if (idx === activeEventIndex) return;
+  activeEventIndex = idx;
+  renderEventsList();
+  markActiveEventMarker();
+  if (idx >= 0 && events[idx]._row) events[idx]._row.scrollIntoView({ block: 'nearest' });
+}
+
+// Entry point for both the map marker and the sidebar row - same dispatch
+// pattern as selectStop() above, through the exact same onPointClick() an
+// ordinary map click uses. Uses ev.video_start (the clip's own file start),
+// NOT ev.start (the estimated trigger instant) - /api/videos matches an
+// Event by exact equality against the file's own start_time (see there), and
+// opening the clip from its own beginning shows the pre-roll leading up to
+// the trigger, which is the whole point of a buffered Event recording.
+function selectEvent(i, { autoplay = false } = {}) {
+  const ev = events[i];
+  if (!ev) return;
+  const point = {
+    t: ev.video_start, t_local: ev.video_start_local,
+    lat: ev.lat, lon: ev.lon,
     speed_mph: 0, speed_kmh: 0, alt_m: 0,
   };
   onPointClick(point, { autoplay });
@@ -659,6 +802,19 @@ function findFirstTrackPointAtOrAfter(ms) {
   return track[lo];
 }
 
+// First index i such that trackMs[i] >= ms, or trackMs.length if every point
+// is earlier than ms (including an empty track). Index form of
+// findFirstTrackPointAtOrAfter above - used to slice a *range* of `track`
+// (the event-halo overlay in selectDay()) rather than return one point.
+function trackIndexAtOrAfter(ms) {
+  let lo = 0, hi = trackMs.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (trackMs[mid] < ms) lo = mid + 1; else hi = mid;
+  }
+  return lo;
+}
+
 // True if `ms` falls inside a covered interval. Binary search for the
 // rightmost interval whose start <= ms (mirror image of
 // findFirstTrackPointAtOrAfter's leftmost-bisect above), then a plain range
@@ -742,17 +898,20 @@ async function selectDay(dateStr) {
   selectedDate = dateStr;
   renderCalendar();
 
-  const [trackRes, stopsRes, coverageRes] = await Promise.all([
+  const [trackRes, stopsRes, eventsRes, coverageRes] = await Promise.all([
     apiFetch(`/api/track?date=${encodeURIComponent(dateStr)}`),
     apiFetch(`/api/stops?date=${encodeURIComponent(dateStr)}`),
+    apiFetch(`/api/events?date=${encodeURIComponent(dateStr)}`),
     apiFetch(`/api/coverage?date=${encodeURIComponent(dateStr)}`),
   ]);
   track = await trackRes.json();
   trackMs = track.map(p => Date.parse(p.t));
   stops = await stopsRes.json();
+  events = await eventsRes.json();
   const coverage = await coverageRes.json();
   coverageMs = coverage.map(iv => [Date.parse(iv.start), Date.parse(iv.end)]);
   activeStopIndex = -1;
+  activeEventIndex = -1;
   hideStopScrubber();
 
   document.getElementById('videos').innerHTML =
@@ -764,7 +923,32 @@ async function selectDay(dateStr) {
   trackLayer.clearLayers();
   renderStopsList();
   renderStopMarkers();
+  renderEventsList();
+  renderEventMarkers();
   if (positionMarker) { map.removeLayer(positionMarker); positionMarker = null; }
+
+  // Event halo: a wide, semi-transparent red underlay on the path itself,
+  // covering each event's own real recorded window [video_start, video_end)
+  // - not just a point marker, and not just a single instant, since the
+  // accelerometer trigger can land anywhere within that ~5-minute buffered
+  // recording (see EventClip's docstring) and the WHOLE window is what the
+  // Event camera was actually recording. Deliberately static (no pulse/
+  // flash animation - requested explicitly) and drawn into trackLayer
+  // before the speed-colored segments below, so it sits underneath them
+  // (Leaflet paints later-added layers on top) and reads as a glow framing
+  // the normal line rather than replacing it. Skipped when video_end is
+  // missing (duration couldn't be measured - see api_events's docstring) or
+  // when fewer than 2 track points fall in the window (too little GPS
+  // coverage there to draw a line at all).
+  for (const ev of events) {
+    if (ev.video_end == null) continue;
+    const i0 = trackIndexAtOrAfter(Date.parse(ev.video_start));
+    const i1 = trackIndexAtOrAfter(Date.parse(ev.video_end));
+    if (i1 - i0 < 2) continue;
+    L.polyline(track.slice(i0, i1).map(p => [p.lat, p.lon]), {
+      color: '#ef4444', weight: 13, opacity: 0.45, lineCap: 'round',
+    }).addTo(trackLayer);
+  }
 
   const bounds = [];
   if (track.length > 0) {
@@ -968,8 +1152,24 @@ function advanceGroupToNextSegment() {
 }
 
 async function onPointClick(point, { autoplay = false } = {}) {
+  // Does point.t fall within a known Event's own recorded window
+  // [video_start, video_end), regardless of which file actually ends up
+  // playing? An accelerometer-triggered Event can fire mid-drive (a
+  // pothole, a hard brake), not just while parked, and Normal video wins
+  // the match in /api/videos whenever both cover the same instant (see
+  // EventClip's docstring) - so without this check, that moment would show
+  // completely ordinary-looking Normal footage with no way to tell an
+  // impact was flagged here. Computed once, up front (purely client-side -
+  // events was already fetched in selectDay(), no need to wait on
+  // /api/videos) and reused in the info panel, the video-block highlight
+  // below, and at the tail (setActiveEvent), rather than recomputing it.
+  const eventIdx = findEventContaining(point.t);
+  const isEventMoment = eventIdx !== -1;
+  const eventBadgeHtml = isEventMoment ? '<span class="event-badge">&#9889; Event</span>' : '';
+
   document.getElementById('info').innerHTML =
-    `<b>${point.t_local.replace('T', ' ').split(/[+-]\d\d:\d\d$/)[0]}</b><br>` +
+    `<b>${point.t_local.replace('T', ' ').split(/[+-]\d\d:\d\d$/)[0]}</b>` +
+    (isEventMoment ? ' <span class="event-badge">&#9889; Event detected</span>' : '') + `<br>` +
     `Speed: ${point.speed_mph} mph (${point.speed_kmh} km/h)<br>` +
     `Altitude: ${point.alt_m} m<br>` +
     `Lat/Lon: ${point.lat.toFixed(6)}, ${point.lon.toFixed(6)}`;
@@ -995,8 +1195,8 @@ async function onPointClick(point, { autoplay = false } = {}) {
     // block the same way a real one does, so no extra CSS is needed here.
     for (const channel of CHANNEL_ORDER) {
       const block = document.createElement('div');
-      block.className = `video-block channel-${channel} gap`;
-      block.innerHTML = `<div class="video-label"><span>${channel}</span></div>
+      block.className = `video-block channel-${channel} gap` + (isEventMoment ? ' event-highlight' : '');
+      block.innerHTML = `<div class="video-label"><span>${channel}</span>${eventBadgeHtml}</div>
         <div class="video-gap-note">No video found covering this timestamp.</div>
         <video></video>`;
       container.appendChild(block);
@@ -1005,15 +1205,17 @@ async function onPointClick(point, { autoplay = false } = {}) {
     setActiveStop(stopIdx);
     if (stopIdx >= 0) showStopScrubberFor(stops[stopIdx], Date.parse(point.t));
     else hideStopScrubber();
+    setActiveEvent(eventIdx);
     reconcileVideoState();
     return;
   }
   for (const channel of channels) {
     const seg = segments[channel];
     const block = document.createElement('div');
-    block.className = `video-block channel-${channel}`;
+    block.className = `video-block channel-${channel}` + (isEventMoment ? ' event-highlight' : '');
     block.innerHTML = `<div class="video-label">
         <span>${channel}</span>
+        ${eventBadgeHtml}
         ${seg.pending_delete ? '<span class="pending-delete-badge">Flagged for deletion</span>' : ''}
         <a class="video-download" href="/original/${encodeURIComponent(seg.filename)}" download title="Download the original, full-resolution file (not the browser-playable transcode)">&#8681; original</a>
       </div>
@@ -1095,6 +1297,7 @@ async function onPointClick(point, { autoplay = false } = {}) {
   setActiveStop(stopIdx);
   if (stopIdx >= 0) showStopScrubberFor(stops[stopIdx], Date.parse(point.t));
   else hideStopScrubber();
+  setActiveEvent(eventIdx);
   reconcileVideoState();
 }
 
