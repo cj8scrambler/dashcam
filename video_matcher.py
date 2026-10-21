@@ -31,6 +31,7 @@ _detect_loop_seconds() itself).
 """
 from __future__ import annotations
 
+import json
 import re
 import statistics
 import threading
@@ -41,6 +42,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import config
 import video_transcode
 
 FILENAME_PATTERN = re.compile(
@@ -142,19 +144,77 @@ def _detect_loop_seconds(start_times_by_channel: dict[str, list[datetime]]) -> f
 # Duration-probe cache for measure_duration=True scans, keyed by resolved path
 # string -> (mtime_ns, size, ffprobe-measured duration_s). scan_video_dir()
 # never opens files for a plain (Normal) scan; this cost only applies to
-# Parking/Timelapse/Event scans, and the cache keeps a LATER re-scan from
-# re-probing files that haven't changed. A plain in-memory dict - NOT
-# persisted anywhere - so it only helps re-scans WITHIN this same running
-# process (DASHCAM_RESCAN_INTERVAL, the reload trigger file); it's empty
-# again after every process restart (a container rebuild/recreate, a
-# gunicorn worker respawn), and that first scan always re-probes everything
-# regardless of how recently a PREVIOUS process already measured those same
-# files - confirmed live 2026-10-15, not a bug (see _duration_cached's
-# docstring for the progress-line confusion this caused). Guarded the same
-# way as gps_parser's _parse_cache, since a periodic re-scan and a
-# trigger-file re-scan could otherwise race.
-_duration_cache: dict[str, tuple[int, int, float]] = {}
+# Parking/Timelapse/Event scans, and the cache keeps a re-probe from re-
+# measuring files whose (mtime, size) signature hasn't changed. Originally a
+# plain in-memory dict with no persistence, so it only helped a re-scan
+# WITHIN the same running process (DASHCAM_RESCAN_INTERVAL, the reload
+# trigger) - every process restart (container rebuild/recreate, a gunicorn
+# worker respawn) started cold and re-probed everything via ffprobe from
+# scratch, confirmed live 2026-10-15 (not a bug, just missing persistence -
+# see _duration_cached's docstring for the progress-line confusion this
+# caused before that was fixed) and again 2026-10-21 (3397 real Parking
+# files: ~276s cold vs 0.0s warm - but "warm" never survived a restart).
+# DURATION_CACHE_PATH below fixes that: _load_duration_cache() seeds this
+# dict from disk once at import time, and _save_duration_cache() (called by
+# scan_video_dir/scan_event_dir after each measure_duration pass) writes the
+# current contents back - so a later process only re-probes files whose
+# signature changed or that are new since the LAST process, not since the
+# dawn of time. Guarded the same way as gps_parser's _parse_cache, since a
+# periodic re-scan and a trigger-file re-scan could otherwise race.
+DURATION_CACHE_PATH = config.CONFIG_DIR / "duration_cache.json"
 _duration_cache_lock = threading.Lock()
+
+
+def _load_duration_cache() -> dict[str, tuple[int, int, float]]:
+    """
+    Seed _duration_cache from DURATION_CACHE_PATH at import time. Tolerant of
+    a missing file (first run ever, or an older version that predates this)
+    or a corrupt/malformed one (a bad write, a hand-edited file) - either
+    way this just starts cold, exactly the old (pre-persistence) behavior,
+    rather than failing the whole module import over a cache file. A single
+    malformed entry is skipped rather than invalidating every other entry in
+    the file.
+    """
+    try:
+        raw = json.loads(DURATION_CACHE_PATH.read_text())
+    except (FileNotFoundError, ValueError, OSError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, tuple[int, int, float]] = {}
+    for key, val in raw.items():
+        try:
+            mtime_ns, size, duration = val
+            out[key] = (int(mtime_ns), int(size), float(duration))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+_duration_cache: dict[str, tuple[int, int, float]] = _load_duration_cache()
+
+
+def _save_duration_cache() -> None:
+    """
+    Persist the current _duration_cache to DURATION_CACHE_PATH (atomic
+    temp-rename, same pattern as app.py's pending_deletes.txt / auth.py's
+    users.json) so the NEXT process start can skip re-probing anything whose
+    (mtime, size) signature hasn't changed since this run measured it.
+    Called at the end of every measure_duration scan (scan_video_dir for
+    Parking, scan_event_dir for Event) - a full rewrite of a few thousand
+    short entries is cheap enough to redo each time rather than track dirty
+    keys. An unwritable config dir degrades to a logged warning rather than
+    failing the scan - losing this run's persistence isn't worth that.
+    """
+    with _duration_cache_lock:
+        snapshot = dict(_duration_cache)
+    try:
+        DURATION_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = DURATION_CACHE_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(snapshot))
+        tmp.replace(DURATION_CACHE_PATH)
+    except OSError as e:
+        print(f"WARNING: could not save duration cache to {DURATION_CACHE_PATH}: {e}")
 
 
 def _probe_file_duration(path: Path) -> float | None:
@@ -180,15 +240,15 @@ def _duration_cached(path: Path) -> bool:
     True if path already has a valid (matching mtime+size) entry in
     _duration_cache, without probing it if not - used only to report real
     numbers in scan_video_dir's progress line ("N already cached, M to
-    probe"), since _duration_cache is a plain in-memory dict with NO
-    persistence across a process restart: it only helps a later re-scan
-    WITHIN the same running process (DASHCAM_RESCAN_INTERVAL, the reload
-    trigger), never across a container restart/rebuild. Confirmed live
-    2026-10-15: right after a rebuild, a scan of thousands of untouched
-    Parking files still probed every one of them - expected, not a bug
-    (cache is cold), but the progress line's wording made it read like the
-    cache should already be active, so this exists to make the count
-    honest instead.
+    probe"). Originally existed because the cache was a plain in-memory
+    dict with no persistence - a scan right after a container rebuild still
+    probed every file (confirmed live 2026-10-15), so the progress line's
+    "cached by mtime+size" wording needed real counts rather than an
+    unconditional claim. DURATION_CACHE_PATH (2026-10-21) now persists the
+    cache to disk, so a hit here can mean either "probed earlier THIS
+    process" or "loaded from disk, probed by an EARLIER process" - this
+    function doesn't distinguish the two, since the progress line only ever
+    needed a hit/miss count, not which process did the probing.
     """
     try:
         st = path.stat()
@@ -314,7 +374,7 @@ def scan_video_dir(
             # promise this particular run doesn't keep.
             already_cached = sum(1 for seg in segments if _duration_cached(seg.path))
             print(f"Probing real duration for {total} {label} file(s) via ffprobe "
-                  f"({already_cached} already cached from an earlier scan this process, "
+                  f"({already_cached} already cached on disk from an earlier scan, "
                   f"{total - already_cached} to probe now)...",
                   flush=True)
         started = time.monotonic()
@@ -329,6 +389,8 @@ def scan_video_dir(
                 print(f"  {label} duration probe: {i}/{total} files ({now - started:.1f}s elapsed)",
                       flush=True)
                 last_logged = now
+        if total:
+            _save_duration_cache()
 
     return segments
 
@@ -453,4 +515,6 @@ def scan_event_dir(
     clips.sort(key=lambda c: c.start_time)
     if measure_duration:
         print(f"  {directory.name} scan: {len(clips)} clips in {time.monotonic() - started:.1f}s", flush=True)
+        if clips:
+            _save_duration_cache()
     return clips
