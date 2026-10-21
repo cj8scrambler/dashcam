@@ -95,6 +95,10 @@ services:
       # file where the real trigger happens, not the file's start - an
       # estimate, not a verified constant (see .env.example).
       DASHCAM_EVENT_TRIGGER_OFFSET_S: "${DASHCAM_EVENT_TRIGGER_OFFSET_S:-60}"
+      # "Status" panel's disk-usage trend chart: sample interval (floored to
+      # 60s) and retention for <config dir>/disk_history.jsonl.
+      DASHCAM_STATUS_HISTORY_INTERVAL: "${DASHCAM_STATUS_HISTORY_INTERVAL:-300}"
+      DASHCAM_STATUS_HISTORY_RETENTION_DAYS: "${DASHCAM_STATUS_HISTORY_RETENTION_DAYS:-14}"
 
     volumes:
       # The SD card / copy of it, containing Normal/ and GPS/. Read-only.

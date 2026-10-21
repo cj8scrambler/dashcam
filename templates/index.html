@@ -46,6 +46,61 @@
     }
     .video-block.gap video { visibility: hidden; }
     .video-block.gap .video-gap-note { display: flex; }
+    /* Install-wide health info - NOT day-dependent (unlike #stops/#events
+       below it), so it's fetched once on load and refreshed on a timer
+       rather than per selected day. Same label/value row shape as #info,
+       but kept in its own bordered section (header style matching
+       #stops-header/#events-header) since it's always-visible global
+       status rather than context for the currently-selected point. */
+    #status { border-bottom: 1px solid #2a2d36; }
+    #status-header { padding: 8px 10px 4px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: #6b7280; }
+    #status-body { padding: 0 10px 10px; }
+    .status-row { display: flex; justify-content: space-between; gap: 8px; padding: 3px 0; font-size: 12px; color: #c3c8d4; }
+    .status-row span:first-child { color: #9aa2b1; }
+    .status-row span:last-child { text-align: right; }
+    .status-bar { height: 4px; border-radius: 2px; background: #232838; margin: 2px 0 5px; overflow: hidden; }
+    .status-bar-fill { height: 100%; width: 0%; background: #22c55e; transition: width 0.3s, background 0.3s; }
+    .status-row.warn span:last-child { color: #eab308; }
+    .status-row.crit span:last-child { color: #ef4444; }
+
+    /* Disk-usage trend chart (camera/data-disk/cache-disk % used over time).
+       Three-series categorical colors are the dataviz skill's validated
+       slots 1/2/3 (dark-mode steps) - deliberately NOT the app's existing
+       green/yellow/red, which are already reserved here for gauge
+       warn/crit status (see .status-row.warn/.crit above) and must never
+       double as a plain series identity. */
+    .trend-wrap { position: relative; margin: 2px 0 10px; }
+    .trend-legend { display: flex; gap: 12px; font-size: 11px; color: #9aa2b1; margin-bottom: 4px; flex-wrap: wrap; }
+    .trend-legend-item { display: flex; align-items: center; gap: 4px; }
+    .trend-legend-dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; }
+    .trend-legend-value { color: #e7e9ee; font-weight: 600; }
+    .trend-svg { width: 100%; height: 90px; display: block; cursor: crosshair; }
+    .trend-line { fill: none; stroke-width: 2px; stroke-linecap: round; stroke-linejoin: round; }
+    .trend-dot { stroke: #181b22; stroke-width: 2px; }
+    .trend-baseline { stroke: #2a2d36; stroke-width: 1px; }
+    .trend-crosshair { stroke: #4b5160; stroke-width: 1px; pointer-events: none; }
+    .trend-empty-text { fill: #4b5160; font-size: 11px; }
+    .trend-tooltip {
+      position: absolute; top: 0; z-index: 20; pointer-events: none; background: rgba(20,22,28,0.95);
+      border: 1px solid #2a2d36; border-radius: 6px; padding: 6px 9px; font-size: 11px; color: #c3c8d4;
+      white-space: nowrap; transform: translateX(-50%);
+    }
+    .trend-tooltip.hidden { display: none; }
+    .trend-tooltip-time { color: #9aa2b1; margin-bottom: 3px; }
+    .trend-tooltip-row { display: flex; align-items: center; gap: 5px; }
+    .trend-tooltip-key { width: 10px; height: 2px; flex: 0 0 auto; }
+    .trend-tooltip-val { color: #fff; font-weight: 600; margin-left: auto; padding-left: 10px; }
+
+    /* Per-directory share of the data disk's total capacity - magnitude
+       encoding, so one sequential hue (blue, per the dataviz skill) rather
+       than the trend chart's categorical identity colors or the gauges'
+       status colors - this isn't "good/bad", just "how big". */
+    #status-dirs-header { font-size: 11px; color: #6b7280; margin: 2px 0 2px; }
+    .dir-row { display: flex; justify-content: space-between; gap: 8px; font-size: 11px; color: #9aa2b1; padding: 2px 0; }
+    .dir-row span:last-child { color: #c3c8d4; }
+    .dir-bar { height: 4px; border-radius: 2px; background: #232838; margin: 1px 0 4px; overflow: hidden; }
+    .dir-bar-fill { height: 100%; background: #2a78d6; }
+
     /* "Stops" - spans of no vehicle movement, from GPS-detected stationary
        periods and Parking/Timelapse clips alike (the sidebar list doesn't
        care which; see the map-marker styling below for the same point). */
@@ -251,7 +306,17 @@
       grid-template-areas: "front rear" "interior map";
       gap: 6px; background: #000;
     }
+    /* Hide the Status panel as soon as a point's been clicked and videos
+       take over #videos - even outside theater mode, where #status would
+       otherwise sit above the video blocks and crowd them. Re-shown by
+       selectDay() (switching days resets #videos to its placeholder) - see
+       setVideosActive(). Theater mode already hides #status too (below);
+       this covers the ordinary sidebar layout, which theater mode's own
+       rule doesn't reach. */
+    #layout.videos-active #status { display: none; }
+
     #layout.theater #calendar,
+    #layout.theater #status,
     #layout.theater #stops,
     #layout.theater #events,
     #layout.theater #info,
@@ -326,6 +391,32 @@
           <button id="cal-next">&rsaquo;</button>
         </div>
         <div id="cal-grid"></div>
+      </div>
+      <div id="status">
+        <div id="status-header">Status</div>
+        <div id="status-body">
+          <div class="status-row"><span>Camera</span><span id="status-camera">—</span></div>
+          <div class="status-bar"><div id="status-camera-bar" class="status-bar-fill"></div></div>
+          <div class="status-row"><span>Last sync</span><span id="status-last-sync">—</span></div>
+          <div class="status-row"><span>Server data disk</span><span id="status-data-disk">—</span></div>
+          <div class="status-bar"><div id="status-data-disk-bar" class="status-bar-fill"></div></div>
+          <div class="status-row"><span>Transcode cache</span><span id="status-cache-disk">—</span></div>
+          <div class="status-bar"><div id="status-cache-disk-bar" class="status-bar-fill"></div></div>
+
+          <div id="status-trend-wrap" class="trend-wrap">
+            <div id="status-trend-legend" class="trend-legend"></div>
+            <svg id="status-trend-svg" class="trend-svg" viewBox="0 0 380 100" preserveAspectRatio="none"></svg>
+            <div id="status-trend-tooltip" class="trend-tooltip hidden"></div>
+          </div>
+
+          <div id="status-dirs-header">Disk usage by directory</div>
+          <div id="status-dirs"></div>
+
+          <div class="status-row"><span>Recordings</span><span id="status-library">—</span></div>
+          <div class="status-row"><span>Data loaded</span><span id="status-loaded-at">—</span></div>
+          <div class="status-row"><span>Last reload</span><span id="status-last-reload">—</span></div>
+          <div class="status-row"><span>Transcoder</span><span id="status-transcoder">—</span></div>
+        </div>
       </div>
       <div id="stops">
         <div id="stops-header">Stops</div>
@@ -829,6 +920,293 @@ function isCovered(ms) {
   return ms < coverageMs[lo][1];
 }
 
+function formatBytes(n) {
+  if (n == null) return '—';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return `${n.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
+function formatAge(seconds) {
+  if (seconds == null) return '—';
+  if (seconds < 0) seconds = 0;
+  if (seconds < 90) return `${Math.round(seconds)}s ago`;
+  const mins = seconds / 60;
+  if (mins < 90) return `${Math.round(mins)}m ago`;
+  const hours = mins / 60;
+  if (hours < 48) return `${Math.round(hours)}h ago`;
+  return `${Math.round(hours / 24)}d ago`;
+}
+
+// Disk-usage gauge coloring reuses the app's existing speed-scale palette
+// (green/yellow/red) rather than inventing a new one, same thresholds for
+// every disk shown here.
+function setDiskGauge(valueId, barId, disk) {
+  const valueEl = document.getElementById(valueId);
+  const bar = document.getElementById(barId);
+  const row = valueEl.closest('.status-row');
+  row.classList.remove('warn', 'crit');
+  if (!disk || disk.percent_used == null) {
+    valueEl.textContent = '—';
+    bar.style.width = '0%';
+    return;
+  }
+  const pct = disk.percent_used;
+  valueEl.textContent = `${formatBytes(disk.free_bytes)} free of ${formatBytes(disk.total_bytes)} (${pct}%)`;
+  bar.style.width = `${Math.min(100, pct)}%`;
+  if (pct >= 90) { bar.style.background = '#ef4444'; row.classList.add('crit'); }
+  else if (pct >= 70) { bar.style.background = '#eab308'; row.classList.add('warn'); }
+  else { bar.style.background = '#22c55e'; }
+}
+
+// Disk-usage trend chart. Categorical identity colors (camera/data/cache),
+// deliberately distinct from the gauges' green/yellow/red status colors
+// above - these three are "which series", not "is it healthy".
+const SVG_NS = 'http://www.w3.org/2000/svg';
+const TREND_SERIES = [
+  { key: 'camera_pct', label: 'Camera', color: '#3987e5' },
+  { key: 'data_pct', label: 'Data disk', color: '#d95926' },
+  { key: 'cache_pct', label: 'Cache disk', color: '#199e70' },
+];
+
+function renderTrendChart(history) {
+  const svg = document.getElementById('status-trend-svg');
+  const legend = document.getElementById('status-trend-legend');
+  const tooltip = document.getElementById('status-trend-tooltip');
+  svg.innerHTML = '';
+  tooltip.classList.add('hidden');
+
+  // loadStatus() re-calls this every 60s; innerHTML='' above clears the old
+  // <polyline>/<circle> children but NOT listeners on the <svg> element
+  // itself, so without this they'd stack a new pointermove/pointerleave
+  // handler on every poll.
+  if (svg._trendHandlers) {
+    svg.removeEventListener('pointermove', svg._trendHandlers.move);
+    svg.removeEventListener('pointerleave', svg._trendHandlers.leave);
+    svg._trendHandlers = null;
+  }
+
+  if (!history || history.length === 0) {
+    legend.innerHTML = '';
+    const text = document.createElementNS(SVG_NS, 'text');
+    text.setAttribute('x', '190');
+    text.setAttribute('y', '50');
+    text.setAttribute('text-anchor', 'middle');
+    text.setAttribute('class', 'trend-empty-text');
+    text.textContent = 'No history yet';
+    svg.appendChild(text);
+    return;
+  }
+
+  const W = 380, H = 100, PAD_TOP = 8, PAD_BOTTOM = 14;
+  const times = history.map(h => Date.parse(h.t));
+  const minT = Math.min(...times), maxT = Math.max(...times);
+  const span = Math.max(maxT - minT, 1);
+  const xOf = t => ((t - minT) / span) * W;
+  const yOf = pct => PAD_TOP + (1 - pct / 100) * (H - PAD_TOP - PAD_BOTTOM);
+
+  const baseline = document.createElementNS(SVG_NS, 'line');
+  baseline.setAttribute('x1', '0');
+  baseline.setAttribute('x2', String(W));
+  baseline.setAttribute('y1', String(yOf(0)));
+  baseline.setAttribute('y2', String(yOf(0)));
+  baseline.setAttribute('class', 'trend-baseline');
+  svg.appendChild(baseline);
+
+  legend.innerHTML = '';
+  for (const series of TREND_SERIES) {
+    // Break the line at missing values rather than interpolating across a
+    // gap (e.g. no camera data at all until the first sync ever lands).
+    const runs = [];
+    let run = [];
+    history.forEach((h, i) => {
+      const v = h[series.key];
+      if (v == null) {
+        if (run.length) runs.push(run);
+        run = [];
+      } else {
+        run.push([xOf(times[i]), yOf(v), v]);
+      }
+    });
+    if (run.length) runs.push(run);
+
+    if (history.length >= 2) {
+      for (const r of runs) {
+        const poly = document.createElementNS(SVG_NS, 'polyline');
+        poly.setAttribute('points', r.map(p => `${p[0].toFixed(1)},${p[1].toFixed(1)}`).join(' '));
+        poly.setAttribute('class', 'trend-line');
+        poly.setAttribute('stroke', series.color);
+        svg.appendChild(poly);
+      }
+    }
+
+    let latestVal = null;
+    if (runs.length) {
+      const lastPoint = runs[runs.length - 1].at(-1);
+      latestVal = lastPoint[2];
+      const dot = document.createElementNS(SVG_NS, 'circle');
+      dot.setAttribute('cx', String(lastPoint[0]));
+      dot.setAttribute('cy', String(lastPoint[1]));
+      dot.setAttribute('r', '4');
+      dot.setAttribute('fill', series.color);
+      dot.setAttribute('class', 'trend-dot');
+      svg.appendChild(dot);
+    }
+
+    const item = document.createElement('div');
+    item.className = 'trend-legend-item';
+    const dotEl = document.createElement('span');
+    dotEl.className = 'trend-legend-dot';
+    dotEl.style.background = series.color;
+    const labelEl = document.createElement('span');
+    labelEl.textContent = series.label;
+    const valEl = document.createElement('span');
+    valEl.className = 'trend-legend-value';
+    valEl.textContent = latestVal != null ? `${latestVal}%` : '—';
+    item.append(dotEl, labelEl, valEl);
+    legend.appendChild(item);
+  }
+
+  if (history.length < 2) return;  // nothing to hover over with a single point
+
+  const crosshair = document.createElementNS(SVG_NS, 'line');
+  crosshair.setAttribute('y1', '0');
+  crosshair.setAttribute('y2', String(H));
+  crosshair.setAttribute('class', 'trend-crosshair');
+  crosshair.style.display = 'none';
+  svg.appendChild(crosshair);
+
+  function showTooltip(evt) {
+    const rect = svg.getBoundingClientRect();
+    const xFrac = Math.min(1, Math.max(0, (evt.clientX - rect.left) / rect.width));
+    const t = minT + xFrac * span;
+    let nearest = 0, best = Infinity;
+    times.forEach((tt, i) => {
+      const d = Math.abs(tt - t);
+      if (d < best) { best = d; nearest = i; }
+    });
+    const h = history[nearest];
+    const x = xOf(times[nearest]);
+    crosshair.setAttribute('x1', String(x));
+    crosshair.setAttribute('x2', String(x));
+    crosshair.style.display = '';
+
+    tooltip.innerHTML = '';
+    const timeEl = document.createElement('div');
+    timeEl.className = 'trend-tooltip-time';
+    timeEl.textContent = new Date(h.t).toLocaleString();
+    tooltip.appendChild(timeEl);
+    for (const series of TREND_SERIES) {
+      const row = document.createElement('div');
+      row.className = 'trend-tooltip-row';
+      const key = document.createElement('span');
+      key.className = 'trend-tooltip-key';
+      key.style.background = series.color;
+      const label = document.createElement('span');
+      label.textContent = series.label;
+      const val = document.createElement('span');
+      val.className = 'trend-tooltip-val';
+      const v = h[series.key];
+      val.textContent = v != null ? `${v}%` : '—';
+      row.append(key, label, val);
+      tooltip.appendChild(row);
+    }
+    tooltip.classList.remove('hidden');
+    const leftPx = (x / W) * rect.width;
+    tooltip.style.left = `${leftPx}px`;
+    tooltip.style.top = `${svg.offsetTop - tooltip.offsetHeight - 4}px`;
+    // Clamp so the tooltip doesn't overflow the sidebar on either edge.
+    const tw = tooltip.offsetWidth;
+    const clamped = Math.max(tw / 2 + 4, Math.min(rect.width - tw / 2 - 4, leftPx));
+    tooltip.style.left = `${clamped}px`;
+  }
+
+  const leaveHandler = () => {
+    crosshair.style.display = 'none';
+    tooltip.classList.add('hidden');
+  };
+  svg.addEventListener('pointermove', showTooltip);
+  svg.addEventListener('pointerleave', leaveHandler);
+  svg._trendHandlers = { move: showTooltip, leave: leaveHandler };
+}
+
+function renderDirectoryBreakdown(breakdown) {
+  const el = document.getElementById('status-dirs');
+  el.innerHTML = '';
+  if (!breakdown || breakdown.length === 0) {
+    el.innerHTML = '<div class="dir-row"><span>—</span></div>';
+    return;
+  }
+  for (const d of breakdown) {
+    const row = document.createElement('div');
+    row.className = 'dir-row';
+    const label = document.createElement('span');
+    label.textContent = d.label;
+    const value = document.createElement('span');
+    value.textContent = `${formatBytes(d.bytes)} (${d.percent_of_disk}%)`;
+    row.append(label, value);
+    const bar = document.createElement('div');
+    bar.className = 'dir-bar';
+    const fill = document.createElement('div');
+    fill.className = 'dir-bar-fill';
+    fill.style.width = `${Math.min(100, d.percent_of_disk)}%`;
+    bar.appendChild(fill);
+    el.append(row, bar);
+  }
+}
+
+async function loadStatus() {
+  let data;
+  try {
+    const res = await apiFetch('/api/status');
+    data = await res.json();
+  } catch (e) {
+    return;  // transient fetch failure - leave the last-known values showing
+  }
+
+  setDiskGauge('status-camera', 'status-camera-bar', data.camera);
+  setDiskGauge('status-data-disk', 'status-data-disk-bar', data.server && data.server.data_disk);
+  setDiskGauge('status-cache-disk', 'status-cache-disk-bar', data.server && data.server.cache_disk);
+
+  const syncRow = document.getElementById('status-last-sync');
+  syncRow.parentElement.classList.remove('warn', 'crit');
+  if (data.last_sync) {
+    const count = data.last_sync.files_synced;
+    const countNote = (count != null) ? `, ${count} file${count === 1 ? '' : 's'}` : '';
+    syncRow.textContent = `${formatAge(data.last_sync.age_seconds)}${countNote}`;
+    if (data.last_sync.age_seconds > 24 * 3600) syncRow.parentElement.classList.add('crit');
+    else if (data.last_sync.age_seconds > 6 * 3600) syncRow.parentElement.classList.add('warn');
+  } else {
+    syncRow.textContent = 'never';
+  }
+
+  renderTrendChart(data.history);
+  renderDirectoryBreakdown(data.directory_breakdown);
+
+  const lib = data.library || {};
+  const parts = [`${lib.video_segments ?? 0} normal`];
+  if (lib.parking_segments) parts.push(`${lib.parking_segments} parking`);
+  if (lib.event_clips) parts.push(`${lib.event_clips} event`);
+  let libText = parts.join(', ');
+  if (lib.pending_deletes) libText += ` · ${lib.pending_deletes} pending delete`;
+  document.getElementById('status-library').textContent = libText;
+
+  const reload = data.last_reload;
+  document.getElementById('status-last-reload').textContent = reload
+    ? `${new Date(reload.loaded_at).toLocaleString()} (+${reload.fixes_added} fixes, ` +
+      `+${reload.segments_added} normal, +${reload.parking_added} parking, +${reload.event_added} event)`
+    : 'no reload yet';
+
+  document.getElementById('status-loaded-at').textContent =
+    lib.loaded_at ? new Date(lib.loaded_at).toLocaleString() : '—';
+
+  document.getElementById('status-transcoder').textContent = data.transcoder || '—';
+
+  document.getElementById('status-cache-disk').title =
+    `Transcode cache itself: ${formatBytes(data.transcode_cache_bytes)}`;
+}
+
 async function loadDays() {
   const res = await apiFetch('/api/days');
   const days = await res.json();
@@ -917,6 +1295,7 @@ async function selectDay(dateStr) {
   document.getElementById('videos').innerHTML =
     '<div class="empty-msg">Click a point on the track to load nearby video.</div>';
   document.getElementById('info').textContent = `${dateStr} - click the path to inspect a point.`;
+  setVideosActive(false);
   activeVideos = [];
   reconcileVideoState();  // switching days abandons anything still pending from the last one
 
@@ -1028,6 +1407,17 @@ const channelFinished = a =>
   a.el.ended ||
   (a.el.paused && a.el.duration > 0 && a.el.currentTime >= a.el.duration - 0.5);
 const groupFinished = () => activeVideos.length > 0 && activeVideos.every(channelFinished);
+
+// Status panel visibility: shown only on initial load, before any point's
+// been clicked - hidden as soon as #videos holds real content, to leave
+// room for the video blocks. Independent of theater mode (which has its own
+// #status display:none rule, for when playback has actually started) -
+// clicking a point shows video blocks immediately, before any 'play' event
+// fires theater mode, so this needs its own toggle rather than reusing that
+// class.
+function setVideosActive(active) {
+  document.getElementById('layout').classList.toggle('videos-active', active);
+}
 
 function enterTheaterMode() {
   document.getElementById('layout').classList.add('theater');
@@ -1166,6 +1556,8 @@ async function onPointClick(point, { autoplay = false } = {}) {
   const eventIdx = findEventContaining(point.t);
   const isEventMoment = eventIdx !== -1;
   const eventBadgeHtml = isEventMoment ? '<span class="event-badge">&#9889; Event</span>' : '';
+
+  setVideosActive(true);  // hide #status now, not after the /api/videos round trip - a click always means "show videos next"
 
   document.getElementById('info').innerHTML =
     `<b>${point.t_local.replace('T', ' ').split(/[+-]\d\d:\d\d$/)[0]}</b>` +
@@ -1418,6 +1810,8 @@ function pollTranscodeProgress(status, filename) {
 }
 
 loadDays();
+loadStatus();
+setInterval(loadStatus, 60000);
 </script>
 </body>
 </html>

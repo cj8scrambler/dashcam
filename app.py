@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import json
 import os
+import shutil
 import sys
 import threading
 import time
@@ -51,6 +53,9 @@ STATE = {
     "prefetch_by_channel": {},   # channel -> Normal+Parking+Event, time-sorted, for _prefetch_neighbors
     "channels_by_start": {},     # start_time -> {channel, ...} across Normal+Parking+Event, same use
     "segment_by_filename": {},   # e.g. "20260904_182500_00002_N_A.MP4" -> VideoSegment; Normal + Parking + Event
+    "earliest_recording": None,  # min start_time across Normal+Parking+Event, for /api/status
+    "latest_recording": None,    # max start_time across Normal+Parking+Event, for /api/status
+    "directory_bytes": {},       # "Normal"/"Parking"/"Event"/"Photo"/"GPS" -> bytes, for /api/status
     "loaded_at": None,
     "_data_dir": None,           # kept so reload_state() can rebuild with the same config
     "_record_tz": None,
@@ -114,6 +119,184 @@ def healthz():
                  "loaded_at": STATE["loaded_at"].isoformat() if STATE["loaded_at"] else None}),
         200 if ready else 503,
     )
+
+
+def _read_sync_status() -> dict | None:
+    """
+    Parse the reload-trigger file's own CONTENT - separate from
+    _trigger_fired()'s use of the same file, which only ever looks at its
+    mtime (see "Live data reload" in CLAUDE.md). The offload daemon writes a
+    small JSON blob to it on every sync batch, e.g.:
+        {"ts": 1792589776, "count": 0, "camera_free_bytes": 1175191552,
+         "camera_used_bytes": 254752927948}
+    (confirmed against the real file in production, 2026-10-21). Tolerant of
+    a missing file (no sync has happened against this install yet), a
+    pre-JSON/empty file, or any individual field being absent (an
+    older/newer uploader version) - this is a read of data the app doesn't
+    control the shape of, so a malformed blob should degrade /api/status to
+    "unknown" for the fields it can't find, not 500 the whole thing.
+    """
+    trigger = os.environ.get("DASHCAM_RELOAD_TRIGGER")
+    if not trigger and STATE["_data_dir"]:
+        trigger = str(STATE["_data_dir"] / ".reload")
+    if not trigger:
+        return None
+    try:
+        raw = Path(trigger).read_text()
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _disk_usage(path) -> dict | None:
+    """shutil.disk_usage() for the filesystem containing `path` - works fine
+    against a read-only mount, since it's reading filesystem metadata, not
+    writing. Callers are responsible for passing a path that actually
+    exists (shutil.disk_usage doesn't walk up to a parent on its own)."""
+    try:
+        usage = shutil.disk_usage(path)
+    except OSError:
+        return None
+    return {
+        "free_bytes": usage.free,
+        "used_bytes": usage.used,
+        "total_bytes": usage.total,
+        "percent_used": round(usage.used / usage.total * 100, 1) if usage.total else None,
+    }
+
+
+@app.route("/api/status")
+def api_status():
+    """
+    Health/status info for the sidebar "Status" panel - deliberately NOT
+    day-dependent (unlike /api/track, /api/stops, /api/events), since it's
+    about the install as a whole, fetched once on page load rather than per
+    selected day.
+
+    - `camera`: free/used/total bytes on the dashcam's own SD card, and
+      `last_sync`: when the offload daemon last wrote to the data dir and how
+      many files that batch carried - both read from the reload-trigger
+      file's JSON content via _read_sync_status() above. `None` if that file
+      doesn't exist or doesn't parse (e.g. a fresh install with no sync yet).
+    - `server`: disk usage for the two volumes that actually matter here -
+      the read-only data mount (where the dashcam's own footage lands - if
+      THIS fills up, syncing presumably starts failing upstream) and the
+      transcode cache volume (regenerable, but worth watching - see
+      video_transcode.py's MAX_CACHE_AGE_DAYS pruning). Both via
+      shutil.disk_usage(), which reports the underlying filesystem regardless
+      of how much of it this container's own volume mount actually owns -
+      on a host where /cache shares a disk with other things, "free" is the
+      disk's free space, not this volume's quota (see CLAUDE.md's note on
+      the 2026-09-21 "No space left on device" incident - that's exactly the
+      number that would have caught it early).
+    - `directory_breakdown`: each of Normal/Parking/Event/Photo/GPS's share of
+      the data disk's total capacity (not of its used space - see the
+      percent_of_disk comment inline below), from STATE["directory_bytes"]
+      (precomputed once per reload in _build_state(), not re-stat'd here).
+    - `transcode_cache_bytes`: actual bytes of cached .mp4s, summed directly
+      (not just disk free space) - lets the UI show "the cache itself is
+      using N GB" independent of what else lives on that disk.
+    - `history`: recent camera/data-disk/cache-disk percent-used samples for
+      the Status panel's trend chart, from DISK_HISTORY_PATH - see
+      _append_disk_history_sample()/start_disk_history_thread() below.
+      Downsampled to a few hundred points regardless of the retention
+      window's raw sample count (_downsample_history()), since this is
+      refetched every 60s by the frontend and the full history doesn't need
+      re-sending that often just to add one point.
+    - `last_reload`: fixes/segments/parking/event deltas from the most recent
+      background re-scan (_last_reload_summary, set by reload_state()) -
+      `None` if no reload has happened yet this run (only the initial
+      install-time load has occurred). Previously this was computed but only
+      ever printed to the log.
+    - `library`: whole-install counts (fixes, segments by source, earliest/
+      latest recording, when this STATE snapshot was built, and how many
+      files are currently queued in pending_deletes.txt - see
+      _read_pending_deletes/api_delete_request) as an at-a-glance sanity
+      check - e.g. a `latest_recording` that's suspiciously old is itself a
+      sign syncing has stalled, independent of `last_sync`.
+    - `transcoder`: video_transcode.encoder_summary() - the same "what's
+      configured" line printed at startup, surfaced here too so it doesn't
+      only live in a log no one's watching.
+    """
+    sync = _read_sync_status()
+    camera = None
+    last_sync = None
+    if sync:
+        free_b, used_b = sync.get("camera_free_bytes"), sync.get("camera_used_bytes")
+        if isinstance(free_b, (int, float)) and isinstance(used_b, (int, float)):
+            camera = {
+                "free_bytes": free_b,
+                "used_bytes": used_b,
+                "total_bytes": free_b + used_b,
+                "percent_used": _pct_used(used_b, free_b),
+            }
+        ts = sync.get("ts")
+        if isinstance(ts, (int, float)):
+            sync_dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+            last_sync = {
+                "at": sync_dt.isoformat(),
+                "at_local": sync_dt.astimezone(STATE["display_tz"]).isoformat(),
+                "age_seconds": (datetime.now(timezone.utc) - sync_dt).total_seconds(),
+                "files_synced": sync.get("count"),
+            }
+
+    cache_dir = video_transcode.CACHE_DIR
+    cache_bytes = (
+        sum(f.stat().st_size for f in cache_dir.glob("*.mp4")) if cache_dir.is_dir() else 0
+    )
+
+    data_dir = STATE["_data_dir"]
+    tz = STATE["display_tz"]
+    earliest, latest = STATE["earliest_recording"], STATE["latest_recording"]
+    data_disk = _disk_usage(data_dir) if data_dir else None
+
+    # Per-directory share of the data disk's TOTAL capacity (not of its used
+    # space - other things on that disk aren't accounted for here, and don't
+    # need to be; the question this answers is "which directory is the big
+    # one", not "where did every used byte go"). STATE["directory_bytes"] is
+    # precomputed once per reload in _build_state() (file.stat() over
+    # thousands of real video files isn't something to redo every poll).
+    directory_breakdown = []
+    if data_disk and data_disk["total_bytes"]:
+        for label, b in STATE["directory_bytes"].items():
+            directory_breakdown.append({
+                "label": label,
+                "bytes": b,
+                "percent_of_disk": round(b / data_disk["total_bytes"] * 100, 1),
+            })
+
+    return jsonify({
+        "camera": camera,
+        "last_sync": last_sync,
+        "server": {
+            "data_disk": data_disk,
+            "cache_disk": _disk_usage(next(
+                (p for p in (cache_dir, cache_dir.parent, cache_dir.parent.parent) if p.is_dir()),
+                Path.home(),
+            )),
+        },
+        "directory_breakdown": directory_breakdown,
+        "transcode_cache_bytes": cache_bytes,
+        "transcoder": video_transcode.encoder_summary(),
+        "history": _downsample_history(_read_disk_history()),
+        "last_reload": _last_reload_summary,
+        "library": {
+            "fixes": len(STATE["fixes"]),
+            "video_segments": len(STATE["video_segments"]),
+            "parking_segments": len(STATE["parking_segments"]),
+            "event_clips": len(STATE["event_clips"]),
+            "pending_deletes": len(_read_pending_deletes()),
+            "earliest_recording": earliest.isoformat() if earliest else None,
+            "earliest_recording_local": earliest.astimezone(tz).isoformat() if earliest else None,
+            "latest_recording": latest.isoformat() if latest else None,
+            "latest_recording_local": latest.astimezone(tz).isoformat() if latest else None,
+            "loaded_at": STATE["loaded_at"].isoformat() if STATE["loaded_at"] else None,
+        },
+    })
 
 
 @app.route("/api/days")
@@ -1137,6 +1320,28 @@ def _build_state(data_dir: Path, record_tz: ZoneInfo, display_tz: ZoneInfo) -> d
     segment_by_filename.update((seg.path.name, seg) for seg in parking_segments)
     segment_by_filename.update((clip.path.name, clip) for clip in event_clips)
 
+    all_starts = [item.start_time for item in segments + parking_segments + event_clips]
+
+    # Per-directory byte totals, for /api/status's disk-usage breakdown.
+    # Normal/Parking/Event reuse the paths already discovered by the scans
+    # above (no second directory walk); Photo/GPS have no equivalent
+    # in-memory file list, so they're stat'd directly. A missing subdirectory
+    # (Photo/ is never required - see CLAUDE.md) is just left out rather than
+    # recorded as 0, so the frontend can tell "doesn't exist" from "empty".
+    directory_bytes: dict[str, int] = {}
+    for label, paths in (("Normal", [s.path for s in segments]),
+                          ("Parking", [s.path for s in parking_segments]),
+                          ("Event", [c.path for c in event_clips])):
+        if paths:
+            directory_bytes[label] = sum(
+                p.stat().st_size for p in paths if p.exists()
+            )
+    for label, subdir in (("Photo", data_dir / "Photo"), ("GPS", gps_dir)):
+        if subdir.is_dir():
+            directory_bytes[label] = sum(
+                f.stat().st_size for f in subdir.rglob("*") if f.is_file()
+            )
+
     return {
         "fixes": fixes,
         "video_segments": segments,
@@ -1148,6 +1353,9 @@ def _build_state(data_dir: Path, record_tz: ZoneInfo, display_tz: ZoneInfo) -> d
         "prefetch_by_channel": dict(prefetch_by_channel),
         "channels_by_start": dict(channels_by_start),
         "segment_by_filename": segment_by_filename,
+        "earliest_recording": min(all_starts) if all_starts else None,
+        "latest_recording": max(all_starts) if all_starts else None,
+        "directory_bytes": directory_bytes,
         "loaded_at": datetime.now(timezone.utc),
         "_data_dir": data_dir,
         "_record_tz": record_tz,
@@ -1171,14 +1379,20 @@ def _install_state(data_dir: Path, record_tz: ZoneInfo, display_tz: ZoneInfo) ->
               "FILENAME_PATTERN against your actual filenames.")
 
 
+_last_reload_summary: dict | None = None  # set by reload_state(), read by /api/status
+
+
 def reload_state() -> dict:
     """
     Re-scan the data dir and swap in a fresh STATE snapshot. Serialized by
     _reload_lock. On any failure the current STATE is left untouched and the
     exception propagates - the caller decides how to report it. Returns a small
-    summary (counts + deltas vs. the previous snapshot).
+    summary (counts + deltas vs. the previous snapshot) and stashes it in
+    _last_reload_summary for /api/status's "delta from the last reload" -
+    previously this was only ever printed, with no way to see it outside the
+    container logs.
     """
-    global STATE
+    global STATE, _last_reload_summary
     with _reload_lock:
         prev = STATE
         new = _build_state(prev["_data_dir"], prev["_record_tz"], prev["display_tz"])
@@ -1193,8 +1407,11 @@ def reload_state() -> dict:
             "segments": len(new["video_segments"]),
             "fixes_added": len(new["fixes"]) - len(prev["fixes"]),
             "segments_added": len(new["video_segments"]) - len(prev["video_segments"]),
+            "parking_added": len(new["parking_segments"]) - len(prev["parking_segments"]),
+            "event_added": len(new["event_clips"]) - len(prev["event_clips"]),
             "loaded_at": new["loaded_at"].isoformat(),
         }
+        _last_reload_summary = summary
     if summary["fixes_added"] or summary["segments_added"]:
         print(f"Reload: {summary['fixes']} fixes (+{summary['fixes_added']}), "
               f"{summary['segments']} segments (+{summary['segments_added']})")
@@ -1273,6 +1490,135 @@ def start_rescan_thread() -> None:
     if trigger:
         bits.append(f"on {trigger} change")
     print(f"Background re-scan: {', '.join(bits)}")
+
+
+DISK_HISTORY_PATH = config.CONFIG_DIR / "disk_history.jsonl"
+_disk_history_lock = threading.Lock()
+_disk_history_thread_started = False
+
+
+def _pct_used(used, free) -> float | None:
+    if not isinstance(used, (int, float)) or not isinstance(free, (int, float)):
+        return None
+    total = used + free
+    return round(used / total * 100, 1) if total else None
+
+
+def _append_disk_history_sample(retention_days: float) -> None:
+    """
+    Append one {"t", "camera_pct", "data_pct", "cache_pct"} sample to
+    DISK_HISTORY_PATH (append-only JSONL, one line per sample - storing the
+    already-computed percentage rather than raw bytes, both to keep each line
+    small and because percentage is exactly what the frontend's trend chart
+    plots) and prune samples older than retention_days in the same pass.
+    Pruning rewrites the whole file (read, filter, atomic temp-rename, same
+    pattern as pending_deletes.txt/users.json elsewhere) - fine at this scale
+    (a few thousand short lines even at the floor interval over a long
+    retention window).
+    """
+    sync = _read_sync_status()
+    camera_pct = _pct_used(
+        sync.get("camera_used_bytes") if sync else None,
+        sync.get("camera_free_bytes") if sync else None,
+    )
+    data_dir = STATE["_data_dir"]
+    data_disk = _disk_usage(data_dir) if data_dir else None
+    cache_dir = video_transcode.CACHE_DIR
+    cache_root = next(
+        (p for p in (cache_dir, cache_dir.parent, cache_dir.parent.parent) if p.is_dir()),
+        Path.home(),
+    )
+    cache_disk = _disk_usage(cache_root)
+    sample = {
+        "t": datetime.now(timezone.utc).isoformat(),
+        "camera_pct": camera_pct,
+        "data_pct": data_disk["percent_used"] if data_disk else None,
+        "cache_pct": cache_disk["percent_used"] if cache_disk else None,
+    }
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+    with _disk_history_lock:
+        try:
+            lines = DISK_HISTORY_PATH.read_text().splitlines()
+        except FileNotFoundError:
+            lines = []
+        kept = []
+        for line in lines:
+            try:
+                row_t = datetime.fromisoformat(json.loads(line)["t"])
+            except (ValueError, KeyError, TypeError):
+                continue  # drop anything that doesn't parse, rather than carry it forever
+            if row_t >= cutoff:
+                kept.append(line)
+        kept.append(json.dumps(sample))
+        DISK_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = DISK_HISTORY_PATH.with_suffix(".jsonl.tmp")
+        tmp.write_text("\n".join(kept) + "\n")
+        tmp.replace(DISK_HISTORY_PATH)
+
+
+def _read_disk_history() -> list[dict]:
+    try:
+        lines = DISK_HISTORY_PATH.read_text().splitlines()
+    except FileNotFoundError:
+        return []
+    out = []
+    for line in lines:
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            continue
+    return out
+
+
+def _downsample_history(history: list[dict], max_points: int = 300) -> list[dict]:
+    """Evenly-strided downsample, keeping the most recent point exactly (a
+    stride-based pick from the front can otherwise land short of the end)."""
+    n = len(history)
+    if n <= max_points:
+        return history
+    stride = n / max_points
+    out = [history[int(i * stride)] for i in range(max_points - 1)]
+    out.append(history[-1])
+    return out
+
+
+def _disk_history_loop(interval_s: float, retention_days: float) -> None:
+    while True:
+        try:
+            _append_disk_history_sample(retention_days)
+        except Exception as e:  # never let a sampling glitch kill the thread
+            print(f"WARNING: disk-history sample failed: {e}")
+        time.sleep(interval_s)
+
+
+def start_disk_history_thread() -> None:
+    """
+    Start the background disk-usage-history sampler for the Status panel's
+    trend chart. Independent of both the frontend's own /api/status polling
+    (which only samples while someone has the page open, and would record
+    nothing overnight) and DASHCAM_RESCAN_INTERVAL (disk usage changes on its
+    own schedule, unrelated to when GPS/video data gets re-scanned). Always
+    runs (unlike start_rescan_thread, which is a no-op with nothing
+    configured) - there's no "off" switch beyond setting the interval high.
+    Idempotent; same process-placement requirement as start_rescan_thread
+    (the gunicorn worker via post_fork, not the preload master).
+    """
+    global _disk_history_thread_started
+    if _disk_history_thread_started:
+        return
+    try:
+        interval = max(float(os.environ.get("DASHCAM_STATUS_HISTORY_INTERVAL", "300")), 60.0)
+    except ValueError:
+        interval = 300.0
+    try:
+        retention_days = max(float(os.environ.get("DASHCAM_STATUS_HISTORY_RETENTION_DAYS", "14")), 1.0)
+    except ValueError:
+        retention_days = 14.0
+    _disk_history_thread_started = True
+    threading.Thread(target=_disk_history_loop, args=(interval, retention_days), daemon=True).start()
+    print(f"Disk-usage history: sampling every {interval:g}s, keeping {retention_days:g}d "
+          f"-> {DISK_HISTORY_PATH}")
 
 
 def create_app():
@@ -1359,6 +1705,7 @@ def main():
     display_tz = ZoneInfo(args.display_timezone) if args.display_timezone else record_tz
     _install_state(data_dir, record_tz, display_tz)
     start_rescan_thread()  # no fork here, so start it directly
+    start_disk_history_thread()
 
     # Dev / single-user path. Auth still applies if users exist, but insecure
     # cookies by default so login works over plain-HTTP localhost. threaded=True

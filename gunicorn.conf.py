@@ -50,3 +50,4 @@ def post_fork(server, worker):
     # never sees. post_fork runs in each worker after the fork.
     import app
     app.start_rescan_thread()
+    app.start_disk_history_thread()
