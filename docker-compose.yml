@@ -175,8 +175,22 @@ services:
       - "${DASHCAM_CONFIG_PATH:?}/sftp/ssh_host_ed25519_key:/etc/ssh/ssh_host_ed25519_key"
       - "${DASHCAM_CONFIG_PATH:?}/sftp/ssh_host_rsa_key:/etc/ssh/ssh_host_rsa_key"
 networks:
+  # external and name are split deliberately: "app-net" below is only this
+  # file's own internal label for the network block - name: is the actual
+  # Docker network it attaches to, and IS meant to be overridden per instance
+  # via DASHCAM_NETWORK (see .env.example). A second instance left on the
+  # SAME real network as production shares Docker's embedded DNS with
+  # whatever else is on it (e.g. an nginx reverse proxy) - confirmed live
+  # 2026-10-26: with production's container stopped, nginx-proxy's
+  # proxy_pass to the "dashcam-viewer" hostname silently resolved to the DEV
+  # container instead, because both services happened to share that network
+  # AND that same service-name alias, serving dev footage on production's
+  # public URL with no error of any kind. Giving a second instance its own
+  # DASHCAM_NETWORK value removes it from production's network entirely, so
+  # this can't happen regardless of service/container naming on either side.
   app-net:
     external: true
+    name: "${DASHCAM_NETWORK:-app-net}"
 
 volumes:
   dashcam-cache:
