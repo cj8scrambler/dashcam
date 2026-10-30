@@ -1398,6 +1398,91 @@ let seekMuteUntil = 0;         // performance.now() until which follower 'seeked
 let advancingToNext = false;  // guards against the group advancing to the next segment more than once
 let failedAdvanceStreak = 0;  // consecutive auto-advances where no channel could be prepared - circuit breaker
 
+// resyncFollowers()'s steady-state drift correction, in seconds. Below
+// SOFT_DRIFT_S the follower is left alone (avoids flapping playbackRate for
+// noise-level jitter); between SOFT_DRIFT_S and HARD_DRIFT_S it's nudged via
+// playbackRate (inaudible on the muted interior/rear channels, and avoids the
+// audio-flush blip a currentTime write causes); at/above HARD_DRIFT_S it's a
+// real desync (e.g. right after another channel's deliberate seek, or a
+// rebuffer stall) and gets a hard seek same as before. Added 2026-10-26: a
+// deliberate jump on one channel (via its native scrubber) was observed live
+// to send the OTHER channels into a repeated hard-seek tug-of-war trying to
+// chase the lead channel's clock - visibly choppy on the channel being
+// corrected, and audibly choppy on the (never-corrected) lead/front channel
+// too, almost certainly from the main-thread churn of those repeated seeks
+// bleeding into its audio pipeline. Softening the common case to a rate nudge
+// removes most of that churn; only a genuine large jump still hard-seeks.
+//
+// HARD_DRIFT_S/FAST_RATE/SLOW_RATE widened 2026-10-26 (still jumpy after the
+// first pass above): a ±7% nudge only closes drift at 0.07s per second of
+// playback, so closing 1.5s of drift took 20+ seconds - nowhere near fast
+// enough to actually resolve before HARD_DRIFT_S's old 1.5s ceiling was hit,
+// so nearly every drift episode escalated to a hard seek anyway regardless of
+// cause (startup stagger, a transcode-contention hiccup, anything). Widening
+// HARD_DRIFT_S to 4s gives the nudge much more runway, and strengthening the
+// nudge to ±15% cuts the time to close a given drift roughly in half - large
+// drift should now mostly resolve via the inaudible rate path instead of
+// escalating. Trade-off: channels can visibly/audibly drift up to ~4s apart
+// (rather than ~1.5s) before a hard seek steps in, so lip-sync is looser
+// moment-to-moment in exchange for far fewer disruptive hard seeks - revisit
+// these numbers based on what the sync debug log actually shows once used.
+const SOFT_DRIFT_S = 0.15;
+const HARD_DRIFT_S = 4.0;
+const FAST_RATE = 1.15;
+const SLOW_RATE = 0.85;
+
+// Sync debug instrumentation - off by default (silent, no overhead beyond one
+// flag check per call site). Turn on with ?syncdebug=1 in the URL. Added
+// 2026-10-26 after playbackRate nudging alone didn't fully resolve a reported
+// post-seek jumpiness, to find out WHAT's actually happening (is a channel
+// genuinely desyncing, stalling/rebuffering, or something else) instead of
+// guessing further blind. Logs every propagate()/resyncFollowers() action
+// taken (not every check - that would be several/sec per channel and drown
+// the console) plus raw media events that indicate a stall or a seek
+// (`waiting`/`stalled`/`seeking`/`seeked`/`ratechange`) with each channel's
+// currentTime/readyState/buffered range at that instant. Also renders a
+// small always-on-top HUD (#sync-debug-hud) with each active channel's live
+// currentTime/rate/drift-from-lead, refreshed ~5x/sec, since reading a wall
+// of console text while also watching for an audible glitch is hard - the HUD
+// lets you see a number spike at the exact moment you hear the stutter.
+const SYNC_DEBUG = new URLSearchParams(location.search).get('syncdebug') === '1';
+function syncLog(...args) {
+  if (SYNC_DEBUG) console.log(`[sync ${performance.now().toFixed(0)}ms]`, ...args);
+}
+function bufferedSummary(el) {
+  const b = el.buffered;
+  const parts = [];
+  for (let i = 0; i < b.length; i++) parts.push(`${b.start(i).toFixed(1)}-${b.end(i).toFixed(1)}`);
+  return parts.join(',') || '(none)';
+}
+let syncHudEl = null;
+function ensureSyncHud() {
+  if (!SYNC_DEBUG || syncHudEl) return;
+  syncHudEl = document.createElement('div');
+  syncHudEl.id = 'sync-debug-hud';
+  syncHudEl.style.cssText = 'position:fixed;top:8px;right:8px;z-index:9999;background:rgba(0,0,0,0.85);' +
+    'color:#0f0;font:11px/1.4 monospace;padding:8px 10px;border-radius:6px;white-space:pre;pointer-events:none;';
+  document.body.appendChild(syncHudEl);
+  setInterval(updateSyncHud, 200);
+}
+function updateSyncHud() {
+  if (!syncHudEl || activeVideos.length === 0) { if (syncHudEl) syncHudEl.textContent = '(no active videos)'; return; }
+  const lead = activeVideos.find(a => !a.broken);
+  const leadAbsMs = lead ? lead.startMs + lead.el.currentTime * 1000 : null;
+  const lines = activeVideos.map(a => {
+    const el = a.el;
+    // Positive = this follower is BEHIND the lead (needs to speed up) - same
+    // sign convention as resyncFollowers()'s own `drift`.
+    const target = lead ? (leadAbsMs - a.startMs) / 1000 : null;
+    const driftS = (lead && a !== lead) ? (target - el.currentTime) : 0;
+    return `${a.channel.padEnd(9)} t=${el.currentTime.toFixed(2).padStart(8)} rate=${el.playbackRate.toFixed(3)} ` +
+      `rs=${el.readyState} paused=${el.paused ? 'Y' : 'N'} drift=${a === lead ? 'LEAD' : driftS.toFixed(2).padStart(6)} ` +
+      `buf=${bufferedSummary(el)}`;
+  });
+  syncHudEl.textContent = lines.join('\n');
+}
+ensureSyncHud();  // no-op unless ?syncdebug=1 - see SYNC_DEBUG above
+
 // A channel is "finished" for advance purposes once it has played to its end,
 // failed to load at all (bad transcode, missing file), or is parked within a
 // hair of its end (a sibling ending first can pause it just short of its own
@@ -1433,10 +1518,68 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Escape') exitTheaterMode();
 });
 
+// Group stall-pause: if ANY active channel stalls (buffering - 'waiting'
+// with no recovery yet), pause the OTHER channels too instead of letting
+// them keep playing ahead unconstrained. Added 2026-10-26 after a captured
+// sync debug log showed the real mechanism behind reported jumpiness: front
+// (the permanent lead, see CHANNEL_ORDER) was repeatedly dropping to
+// readyState 2 and firing 'waiting' for a second or two at a time - a real
+// buffering stall, nothing to do with drift correction - while interior/rear
+// kept playing right through it and ended up several real seconds ahead of
+// front by the time it recovered. resyncFollowers() then saw drift well past
+// HARD_DRIFT_S and hard-seeked the two PERFECTLY FINE channels backward to
+// match the struggling lead - the visible/audible jumpiness was being
+// inflicted on channels that were never actually the problem. Pausing
+// everyone together while any one channel is stalled, and resuming together
+// once it clears, keeps drift from building up in the first place, so
+// there's usually little or nothing left to hard-seek once the stall ends.
+// Not yet exercised live - see "Verification status" in CLAUDE.md.
+const stalledChannels = new Set();  // channel names currently 'waiting' with no recovery yet
+let stallSyncGuard = false;         // suppresses wireSyncedPlayback's own pause/play propagate() calls below
+
+function onChannelWaiting(av) {
+  if (av.broken) return;
+  if (stalledChannels.size === 0) {
+    syncLog(`GROUP STALL: pausing others for ${av.channel}'s buffering`);
+    stallSyncGuard = true;
+    for (const other of activeVideos) {
+      if (other === av || other.broken || other.el.paused) continue;
+      other.stallPaused = true;
+      other.el.pause();
+    }
+    stallSyncGuard = false;
+  }
+  stalledChannels.add(av.channel);
+}
+
+function onChannelRecovered(av) {
+  if (av.broken || !stalledChannels.has(av.channel)) return;
+  stalledChannels.delete(av.channel);
+  if (stalledChannels.size > 0) return;  // still waiting on another channel
+  syncLog('GROUP STALL cleared - resuming');
+  stallSyncGuard = true;
+  for (const other of activeVideos) {
+    if (other.stallPaused) {
+      other.stallPaused = false;
+      other.el.play().catch(() => {});
+    }
+  }
+  stallSyncGuard = false;
+  // One clean resync from the original lead once everyone's moving again -
+  // should be near-zero drift since the group paused together, but this
+  // covers any residual rather than assuming it's exactly zero.
+  const lead = activeVideos.find(a => !a.broken);
+  if (lead) propagate(lead.el, lead.startMs);
+}
+
 function wireSyncedPlayback() {
   for (const { el, startMs } of activeVideos) {
-    el.addEventListener('play', () => propagate(el, startMs, /*enterTheater=*/true));
+    el.addEventListener('play', () => {
+      if (stallSyncGuard) return;  // our own resume after a group stall, not a real user/master play
+      propagate(el, startMs, /*enterTheater=*/true);
+    });
     el.addEventListener('pause', () => {
+      if (stallSyncGuard) return;  // our own pause to hold this channel for a stalled sibling, not a real pause
       // A video reaching its end fires 'pause' (then 'ended') with currentTime
       // sitting right on duration. Don't let that drag the other channels to a
       // stop - they need to reach their own ends and fire their own 'ended' so
@@ -1449,6 +1592,7 @@ function wireSyncedPlayback() {
       // follower (see seekMuteUntil) - otherwise every sync kicks off another
       // and the channels ping-pong seeks (stutter, audio glitching).
       if (performance.now() < seekMuteUntil) return;
+      syncLog('seeked (user/native, not muted) ->', activeVideos.find(a => a.el === el)?.channel, 'at', el.currentTime.toFixed(2));
       propagate(el, startMs);
     });
   }
@@ -1458,16 +1602,23 @@ function wireSyncedPlayback() {
 // state. A follower whose footage doesn't reach that instant is paused and
 // blanked instead. Only a real 'play' event enters theater mode.
 function propagate(masterEl, masterStartMs, enterTheater) {
-  if (syncingPlayback) return;
+  if (syncingPlayback) { syncLog('propagate() re-entrant call ignored'); return; }
   syncingPlayback = true;
   const masterAbsMs = masterStartMs + masterEl.currentTime * 1000;
   const masterPaused = masterEl.paused;
-  for (const { el, startMs, broken } of activeVideos) {
+  if (SYNC_DEBUG) {
+    const masterChannel = activeVideos.find(a => a.el === masterEl)?.channel;
+    syncLog(`propagate() master=${masterChannel} t=${masterEl.currentTime.toFixed(2)} paused=${masterPaused}`);
+  }
+  for (const av of activeVideos) {
+    const { channel, el, startMs, broken } = av;
     if (el === masterEl || broken) continue;
+    el.playbackRate = 1;  // discard any in-progress resyncFollowers() rate nudge - a deliberate hard sync supersedes it
     const block = el.closest('.video-block');
     const dur = el.duration || 0;
     const target = (masterAbsMs - startMs) / 1000;
     if (dur && target >= dur) {
+      syncLog(`  ${channel}: target ${target.toFixed(2)} >= duration ${dur.toFixed(2)} -> gap, pausing`);
       if (block) block.classList.add('gap');
       if (!el.paused) el.pause();
       continue;
@@ -1475,11 +1626,12 @@ function propagate(masterEl, masterStartMs, enterTheater) {
     if (block) block.classList.remove('gap');
     const clamped = Math.max(0, Math.min(target, dur || target));
     if (Math.abs(el.currentTime - clamped) > 0.3) {
+      syncLog(`  ${channel}: HARD SEEK ${el.currentTime.toFixed(2)} -> ${clamped.toFixed(2)} (readyState=${el.readyState}, buffered=${bufferedSummary(el)})`);
       seekMuteUntil = performance.now() + 700;  // the 'seeked' this write triggers is ours, not the user's
       el.currentTime = clamped;
     }
-    if (masterPaused && !el.paused) el.pause();
-    else if (!masterPaused && el.paused) el.play().catch(() => {});
+    if (masterPaused && !el.paused) { syncLog(`  ${channel}: pause (master paused)`); el.pause(); }
+    else if (!masterPaused && el.paused && !av.stallPaused) { syncLog(`  ${channel}: play() (master playing)`); el.play().catch(() => {}); }
   }
   syncingPlayback = false;
   if (enterTheater && !masterPaused) enterTheaterMode();
@@ -1490,17 +1642,32 @@ function propagate(masterEl, masterStartMs, enterTheater) {
 // user-seek's follow-up sync got swallowed by the seek-mute window, without
 // the tight ping-pong that reacting to every 'seeked' would cause.
 function resyncFollowers(lead) {
-  if (syncingPlayback || performance.now() < seekMuteUntil) return;
+  if (syncingPlayback) return;
+  if (performance.now() < seekMuteUntil) { syncLog('resyncFollowers() skipped - seek-muted'); return; }
   if (lead.el.paused) return;
   const absMs = lead.startMs + lead.el.currentTime * 1000;
-  for (const { el, startMs, broken } of activeVideos) {
+  for (const { channel, el, startMs, broken } of activeVideos) {
     if (el === lead.el || broken || el.paused) continue;
     const dur = el.duration || 0;
     const target = (absMs - startMs) / 1000;
     if (dur && target >= dur) continue;  // handled by the gap logic
-    if (Math.abs(el.currentTime - target) > 0.5) {
+    const drift = target - el.currentTime;  // positive: follower is behind, needs to speed up
+    const absDrift = Math.abs(drift);
+    if (absDrift >= HARD_DRIFT_S) {
+      // A real desync (post-seek settling, a rebuffer stall) - a rate nudge
+      // would take too long to close this, so snap directly same as before.
+      syncLog(`  ${channel}: HARD SEEK (drift=${drift.toFixed(2)}s) ${el.currentTime.toFixed(2)} -> ${target.toFixed(2)} ` +
+        `(readyState=${el.readyState}, buffered=${bufferedSummary(el)})`);
       seekMuteUntil = performance.now() + 700;
       el.currentTime = Math.max(0, Math.min(target, dur || target));
+      el.playbackRate = 1;
+    } else if (absDrift >= SOFT_DRIFT_S) {
+      const newRate = drift > 0 ? FAST_RATE : SLOW_RATE;
+      if (el.playbackRate !== newRate) syncLog(`  ${channel}: rate nudge (drift=${drift.toFixed(2)}s) -> ${newRate}`);
+      el.playbackRate = newRate;
+    } else if (el.playbackRate !== 1) {
+      syncLog(`  ${channel}: drift settled (${drift.toFixed(2)}s) -> rate back to 1`);
+      el.playbackRate = 1;  // close enough now - stop nudging
     }
   }
 }
@@ -1605,6 +1772,14 @@ async function onPointClick(point, { autoplay = false } = {}) {
     const seg = segments[channel];
     const block = document.createElement('div');
     block.className = `video-block channel-${channel}` + (isEventMoment ? ' event-highlight' : '');
+    // preload="auto" (not "metadata") since 2026-10-26 - hints the browser to
+    // buffer this channel eagerly rather than just enough to read its
+    // duration, so there's more of a cushion before a brief throughput dip
+    // turns into an actual stall (see the group stall-pause comment above
+    // wireSyncedPlayback() for why that matters here specifically: front/rear
+    // are 3x+ larger files than interior for the same real duration, so they
+    // run out of buffer first). Just a hint, not a guarantee - the browser
+    // still decides how far ahead it's actually willing to go.
     block.innerHTML = `<div class="video-label">
         <span>${channel}</span>
         ${eventBadgeHtml}
@@ -1617,7 +1792,7 @@ async function onPointClick(point, { autoplay = false } = {}) {
         <div class="v-progress-text">Starting&hellip;</div>
       </div>
       <div class="video-gap-note">No footage from this camera for this moment.</div>
-      <video controls preload="metadata" src="${seg.url}"${channel === 'front' ? '' : ' muted'}></video>`;
+      <video controls preload="auto" src="${seg.url}"${channel === 'front' ? '' : ' muted'}></video>`;
     container.appendChild(block);
     const status = block.querySelector('.video-status');
     const gapNote = block.querySelector('.video-gap-note');
@@ -1632,9 +1807,28 @@ async function onPointClick(point, { autoplay = false } = {}) {
     // to 1 (realtime) right at a segment's own start, where elapsed is 0.
     const elapsedRealS = (Date.parse(point.t) - startMs) / 1000;
     const ratio = elapsedRealS > 0 ? seg.offset_seconds / elapsedRealS : 1;
-    const av = { channel, el: v, filename: seg.filename, startMs, endMs: Date.parse(seg.end_time), broken: false, cancelledForDeletion: false, ratio };
+    const av = { channel, el: v, filename: seg.filename, startMs, endMs: Date.parse(seg.end_time), broken: false, cancelledForDeletion: false, ratio, stallPaused: false };
     trackedFilenames.add(seg.filename);
 
+    // Always active (not gated by SYNC_DEBUG) - see the group stall-pause
+    // comment above wireSyncedPlayback() for why.
+    v.addEventListener('waiting', () => onChannelWaiting(av));
+    v.addEventListener('playing', () => onChannelRecovered(av));
+    v.addEventListener('canplay', () => { if (v.readyState >= 3) onChannelRecovered(av); });
+
+    if (SYNC_DEBUG) {
+      // Raw media events, logged with no other logic attached, so a real
+      // stall/rebuffer (waiting/stalled) can be told apart from our own sync
+      // corrections above (which log themselves separately) - e.g. if a
+      // 'waiting' burst lines up with a reported stutter but no HARD SEEK /
+      // rate-nudge log appears nearby, the cause is buffering, not sync.
+      let seekStartedAt = 0;
+      for (const evt of ['waiting', 'stalled', 'suspend', 'playing', 'canplay', 'ratechange', 'emptied']) {
+        v.addEventListener(evt, () => syncLog(`${channel}: '${evt}' t=${v.currentTime.toFixed(2)} readyState=${v.readyState} rate=${v.playbackRate.toFixed(3)}`));
+      }
+      v.addEventListener('seeking', () => { seekStartedAt = performance.now(); syncLog(`${channel}: 'seeking' -> target ${v.currentTime.toFixed(2)}`); });
+      v.addEventListener('seeked', () => syncLog(`${channel}: 'seeked' landed at ${v.currentTime.toFixed(2)} (took ${(performance.now() - seekStartedAt).toFixed(0)}ms)`));
+    }
     v.addEventListener('loadedmetadata', () => { v.currentTime = seg.offset_seconds; });
     v.addEventListener('loadeddata', () => {
       markResolved(status, seg.filename);
@@ -1656,6 +1850,11 @@ async function onPointClick(point, { autoplay = false } = {}) {
       // loaded channel is finished do we advance to the next segment. This
       // keeps playback time moving forward instead of a short clip on one
       // channel yanking the whole group back to a segment boundary.
+      // A channel that ends (or errors, below) while marked as stalled would
+      // otherwise block onChannelRecovered() from ever seeing the group as
+      // caught up again, wedging every sibling we paused for it. It's done
+      // contributing frames either way, so stop waiting on it.
+      onChannelRecovered(av);
       if (!groupFinished()) {
         block.classList.add('gap');
         return;
@@ -1666,6 +1865,7 @@ async function onPointClick(point, { autoplay = false } = {}) {
       // Transcode failed / file unavailable. Treat this channel as finished
       // (blanked) rather than leaving a dead "preparing..." panel, and don't
       // let it wedge the group - if it's the last one outstanding, advance.
+      onChannelRecovered(av);  // see the 'ended' handler above - don't let a stalled-then-broken channel wedge the group (must run before av.broken=true, which onChannelRecovered itself checks)
       av.broken = true;
       markResolved(status, seg.filename);
       gapNote.textContent = 'Video unavailable for this segment.';

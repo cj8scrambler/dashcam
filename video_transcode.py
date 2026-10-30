@@ -279,6 +279,23 @@ def encoder_summary() -> str:
     return f"software libx264 ({FFMPEG_PRESET}, crf {FFMPEG_CRF}), ≤{TRANSCODE_CONCURRENCY} concurrent"
 
 
+# Forces a keyframe every KEYFRAME_INTERVAL_S seconds of output, regardless of
+# the source's frame rate (expressed in playback time via -force_key_frames,
+# not a frame count via -g, since the Vantrue footage's actual fps isn't
+# probed anywhere in this codebase - a time expression stays correct whatever
+# it turns out to be). Without this, libx264/h264_nvenc fall back to their own
+# default GOP (libx264's is 250 frames - several seconds at typical dashcam
+# frame rates), which makes every seek - including the frontend's frequent
+# cross-channel sync corrections, see templates/index.html's resyncFollowers -
+# slow and imprecise: a seek lands near the nearest keyframe rather than
+# exactly on target, which can itself leave enough residual drift to trigger
+# another correction shortly after. Added 2026-10-26 after the maintainer
+# reported audibly jumpy/stuttering synced playback. Only affects newly
+# transcoded files - anything already in the cache keeps its old GOP until
+# it's evicted (MAX_CACHE_AGE_DAYS) or deleted and re-transcoded.
+KEYFRAME_INTERVAL_S = "2"
+
+
 def _ffmpeg_cmd(src: Path, tmp_dest: Path, *, gpu: bool) -> list[str]:
     tail = [
         "-c:a", "aac",
@@ -287,6 +304,7 @@ def _ffmpeg_cmd(src: Path, tmp_dest: Path, *, gpu: bool) -> list[str]:
         "-progress", "pipe:1", "-nostats",
         str(tmp_dest),
     ]
+    force_keyframes = ["-force_key_frames", f"expr:gte(t,n_forced*{KEYFRAME_INTERVAL_S})"]
     if gpu:
         # Decode on the GPU (-hwaccel cuda), keep frames in GPU memory
         # (-hwaccel_output_format cuda), resize and encode there too - no
@@ -297,6 +315,7 @@ def _ffmpeg_cmd(src: Path, tmp_dest: Path, *, gpu: bool) -> list[str]:
             "-i", str(src),
             "-vf", f"scale_cuda={SCALE_WIDTH}:-2",
             "-c:v", "h264_nvenc", "-preset", NVENC_PRESET, "-cq", NVENC_CQ, "-b:v", "0",
+            *force_keyframes,
             *tail,
         ]
     return [
@@ -304,6 +323,7 @@ def _ffmpeg_cmd(src: Path, tmp_dest: Path, *, gpu: bool) -> list[str]:
         "-i", str(src),
         "-vf", f"scale={SCALE_WIDTH}:-2",
         "-c:v", "libx264", "-preset", FFMPEG_PRESET, "-crf", FFMPEG_CRF,
+        *force_keyframes,
         *tail,
     ]
 
